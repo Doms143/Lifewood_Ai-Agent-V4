@@ -1,5 +1,7 @@
 import os
 import json
+import base64
+import json as json_module
 import tempfile
 import uuid
 from django.shortcuts import redirect
@@ -70,8 +72,20 @@ def google_drive_auth(request):
 def _get_or_create_google_user(creds):
     """Map the Google account to a local Django user using the id_token."""
     id_token = creds.id_token
+
+    # id_token may be a raw JWT string — decode the payload if so
+    if isinstance(id_token, str):
+        try:
+            # JWT is three base64 parts separated by dots — payload is the middle one
+            payload_b64 = id_token.split('.')[1]
+            # Add padding if needed
+            payload_b64 += '=' * (4 - len(payload_b64) % 4)
+            id_token = json_module.loads(base64.urlsafe_b64decode(payload_b64))
+        except Exception as e:
+            raise ValueError(f'Failed to decode id_token JWT: {e}')
+
     if not id_token or not isinstance(id_token, dict):
-        raise ValueError(f'id_token missing or invalid: {id_token}')
+        raise ValueError(f'id_token missing or invalid after decode: {id_token}')
 
     email = id_token.get('email')
     if not email:
