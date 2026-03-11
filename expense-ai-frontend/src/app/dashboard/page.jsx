@@ -88,7 +88,7 @@ export default function Dashboard() {
         fetchReceipts({ limit: 50 }),
       ]);
       setSummary(s);
-      setCategories(c.categories || c || []);
+      setCategories(c.by_category || []);
       setTrends(t);
       setReceipts(r.receipts || r || []);
       setLastRefresh(new Date());
