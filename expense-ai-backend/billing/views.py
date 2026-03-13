@@ -138,7 +138,7 @@ def send_message(request):
             n8n_response = http_requests.post(
                 N8N_WEBHOOK_URL,
                 json=n8n_payload,
-                timeout=60,
+                timeout=100,
             )
             n8n_response.raise_for_status()
             n8n_data = n8n_response.json()
@@ -333,15 +333,24 @@ def save_receipt(request):
 
 
 @require_GET
-@require_auth
 def list_receipts(request):
     """
-    Returns all receipts for the current user with optional filters.
+    Returns all receipts. Accepts session auth (frontend) or X-Agent-Secret (n8n).
 
     GET /api/billing/receipts/
-    Query params: ?category=meals_entertainment&status=processed&start=2024-01-01&end=2024-12-31
     """
-    receipts = Receipt.objects.filter(user=request.user)
+    agent_secret = os.environ.get('N8N_AGENT_SECRET', '')
+    request_secret = request.headers.get('X-Agent-Secret', '')
+    is_n8n = agent_secret and request_secret == agent_secret
+
+    if is_n8n:
+        # n8n: return all receipts across all users
+        receipts = Receipt.objects.all()
+    elif request.user and request.user.is_authenticated:
+        # Frontend: return only this user's receipts
+        receipts = Receipt.objects.filter(user=request.user)
+    else:
+        return JsonResponse({'error': 'Not authenticated'}, status=401)
 
     category = request.GET.get('category')
     status = request.GET.get('status')
@@ -373,7 +382,6 @@ def list_receipts(request):
         ],
         'total_count': receipts.count(),
     })
-
 
 @require_GET
 @require_auth
