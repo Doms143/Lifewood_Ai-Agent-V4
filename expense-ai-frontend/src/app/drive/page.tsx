@@ -266,9 +266,7 @@ export default function DrivePage() {
       <section className={styles.heroBanner}>
         <div className={styles.heroBannerLeft}>
           <span className={styles.heroTagline}>
-            <span className={styles.heroTaglineOn}>ALWAYS ON</span>
-            <span className={styles.heroTaglineDivider} aria-hidden="true">/</span>
-            <span className={styles.heroTaglineOff}>NEVER OFF</span>
+            <span className={styles.heroTaglineOn}>ALWAYS ON</span><span className={styles.heroTaglineOff}>NEVER OFF</span>
           </span>
           <h1
             className={`${styles.greetingText} ${styles.greetingHeader} ${
