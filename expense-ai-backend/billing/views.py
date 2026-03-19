@@ -38,6 +38,7 @@ def _is_n8n_request(request):
     request_secret = request.headers.get('X-Agent-Secret', '')
     return bool(agent_secret and request_secret == agent_secret)
 
+
 def _get_n8n_credentials():
     from google_drive.models import GoogleDriveToken
     from google_drive.utils import get_credentials_from_token
@@ -45,6 +46,7 @@ def _get_n8n_credentials():
     if not token:
         return None
     return get_credentials_from_token(token)
+
 
 def parse_date_range(request):
     """
@@ -256,7 +258,7 @@ def list_conversations(request):
 
 
 # ─────────────────────────────────────────────
-# MEMORY ENDPOINT  (NEW)
+# MEMORY ENDPOINT
 # ─────────────────────────────────────────────
 
 @csrf_exempt
@@ -266,10 +268,6 @@ def chat_memory(request):
     Returns relevant past messages scoped strictly to ONE user.
     n8n can call this with X-Agent-Secret + user_id param.
     Frontend users can call this with session auth (own messages only).
-
-    Privacy guarantee: a user can NEVER retrieve another user's messages.
-    n8n passes user_id so the agent can recall history for the active user,
-    but that user_id scope is enforced here — not in n8n.
 
     GET /api/billing/chat/memory/?query=vat+receipts&limit=8&user_id=1
     Header: X-Agent-Secret (for n8n) OR session cookie (for frontend)
@@ -291,7 +289,6 @@ def chat_memory(request):
     query = request.GET.get('query', '').strip()
     limit = min(int(request.GET.get('limit', 8)), 20)
 
-    # Always scoped to this user only
     base_qs = (
         ChatMessage.objects
         .filter(conversation__user=user)
@@ -300,10 +297,7 @@ def chat_memory(request):
     )
 
     if query:
-        # Search across both user questions and agent replies
-        base_qs = base_qs.filter(
-            Q(content__icontains=query)
-        )
+        base_qs = base_qs.filter(Q(content__icontains=query))
 
     messages_page = base_qs[:limit]
 
@@ -314,7 +308,6 @@ def chat_memory(request):
             {
                 'id': m.id,
                 'role': m.role,
-                # Truncate very long messages so the agent prompt stays lean
                 'content': m.content[:600] + ('...' if len(m.content) > 600 else ''),
                 'conversation_id': m.conversation_id,
                 'conversation_title': m.conversation.title,
@@ -739,7 +732,6 @@ def n8n_analytics_proxy(request):
         expense_date__range=[start, today],
     )
 
-    # Previous month for comparison
     prev_end = start - timedelta(days=1)
     prev_start = prev_end.replace(day=1)
     prev_total = Receipt.objects.filter(
@@ -805,9 +797,22 @@ def n8n_analytics_proxy(request):
             for r in recent_receipts
         ],
     })
-    
+
+
+# ─────────────────────────────────────────────
+# OCR ENDPOINT
+# ─────────────────────────────────────────────
+
 @csrf_exempt
 def process_ocr(request):
+    """
+    Called by n8n to download a Drive file, run OCR via OpenRouter,
+    and save the result directly to the database.
+
+    POST /api/billing/receipts/process-ocr/
+    Header: X-Agent-Secret: <N8N_AGENT_SECRET>
+    Body: { "file_id": "...", "file_name": "...", "folder_id": "...", "folder_name": "..." }
+    """
     if not _is_n8n_request(request):
         return JsonResponse({'error': 'Unauthorized'}, status=401)
 
@@ -924,29 +929,50 @@ Rules:
             'total': 0,
         }
 
+    # Parse expense date
+    expense_date = None
+    date_str = ocr_data.get('expense_date', '')
+    if date_str:
+        for fmt in ('%Y-%m-%d', '%m/%d/%Y', '%d/%m/%Y'):
+            try:
+                expense_date = datetime.strptime(date_str, fmt).date()
+                break
+            except ValueError:
+                continue
+
+    # Save receipt directly in Django
+    Receipt.objects.update_or_create(
+        drive_file_id=file_id,
+        defaults={
+            'drive_file_name':    file_name,
+            'drive_folder_id':    folder_id,
+            'drive_folder_name':  folder_name,
+            'status':             'processed',
+            'ocr_raw_text':       reply,
+            'ocr_processed_at':   timezone.now(),
+            'document_type':      ocr_data.get('document_type',     'unknown'),
+            'vat_type':           ocr_data.get('vat_type',          'unknown'),
+            'expense_category':   ocr_data.get('expense_category',  'uncategorized'),
+            'business_name':      ocr_data.get('business_name',     ''),
+            'business_address':   ocr_data.get('business_address',  ''),
+            'tin':                ocr_data.get('tin',               ''),
+            'receipt_number':     ocr_data.get('receipt_number',    ''),
+            'bir_permit_number':  ocr_data.get('bir_permit_number', ''),
+            'expense_date':       expense_date,
+            'description':        ocr_data.get('description',       ''),
+            'buyer_name':         ocr_data.get('buyer_name',        ''),
+            'buyer_tin':          ocr_data.get('buyer_tin',         ''),
+            'subtotal':           Decimal(str(ocr_data.get('subtotal',         0) or 0)),
+            'vatable_sales':      Decimal(str(ocr_data.get('vatable_sales',    0) or 0)),
+            'vat_exempt_sales':   Decimal(str(ocr_data.get('vat_exempt_sales', 0) or 0)),
+            'zero_rated_sales':   Decimal(str(ocr_data.get('zero_rated_sales', 0) or 0)),
+            'vat_amount':         Decimal(str(ocr_data.get('vat_amount',       0) or 0)),
+            'total':              Decimal(str(ocr_data.get('total',            0) or 0)),
+        }
+    )
+
     return JsonResponse({
-        'drive_file_id':      file_id,
-        'drive_file_name':    file_name,
-        'drive_folder_id':    folder_id,
-        'drive_folder_name':  folder_name,
-        'status':             'processed',
-        'ocr_raw_text':       reply,
-        'document_type':      ocr_data.get('document_type',     'unknown'),
-        'vat_type':           ocr_data.get('vat_type',          'unknown'),
-        'expense_category':   ocr_data.get('expense_category',  'uncategorized'),
-        'business_name':      ocr_data.get('business_name',     ''),
-        'business_address':   ocr_data.get('business_address',  ''),
-        'tin':                ocr_data.get('tin',               ''),
-        'receipt_number':     ocr_data.get('receipt_number',    ''),
-        'bir_permit_number':  ocr_data.get('bir_permit_number', ''),
-        'expense_date':       ocr_data.get('expense_date',      ''),
-        'description':        ocr_data.get('description',       ''),
-        'buyer_name':         ocr_data.get('buyer_name',        ''),
-        'buyer_tin':          ocr_data.get('buyer_tin',         ''),
-        'subtotal':           float(ocr_data.get('subtotal',         0) or 0),
-        'vatable_sales':      float(ocr_data.get('vatable_sales',    0) or 0),
-        'vat_exempt_sales':   float(ocr_data.get('vat_exempt_sales', 0) or 0),
-        'zero_rated_sales':   float(ocr_data.get('zero_rated_sales', 0) or 0),
-        'vat_amount':         float(ocr_data.get('vat_amount',       0) or 0),
-        'total':              float(ocr_data.get('total',            0) or 0),
+        'status': 'ok',
+        'file_id': file_id,
+        'file_name': file_name,
     })
