@@ -789,46 +789,75 @@ def n8n_analytics_proxy(request):
 
 
 # ─────────────────────────────────────────────
-# OCR ENDPOINT (called by n8n Drive workflow)
+# GOOGLE DRIVE HELPERS (for chat upload)
 # ─────────────────────────────────────────────
 
-@csrf_exempt
-def process_ocr(request):
-    if not _is_n8n_request(request):
-        return JsonResponse({'error': 'Unauthorized'}, status=401)
-
-    try:
-        data = json.loads(request.body)
-    except Exception:
-        return JsonResponse({'error': 'Invalid JSON body'}, status=400)
-
-    file_id     = data.get('file_id')
-    folder_id   = data.get('folder_id', '')
-    folder_name = data.get('folder_name', '')
-    file_name   = data.get('file_name', '')
-
-    if not file_id:
-        return JsonResponse({'error': 'file_id is required'}, status=400)
-
+def _get_drive_folders():
+    """
+    Returns all Google Drive folders as a list of dicts: [{id, name, parent_id}]
+    Scoped to folders that contain 'lifewood' OR all folders if none found.
+    """
     creds = _get_n8n_credentials()
     if not creds:
-        return JsonResponse({'error': 'No stored Google credentials.'}, status=401)
+        return []
+    from googleapiclient.discovery import build
+    service = build('drive', 'v3', credentials=creds)
+    results = service.files().list(
+        q="mimeType='application/vnd.google-apps.folder' and trashed=false",
+        fields="files(id, name, parents)",
+        pageSize=200,
+        orderBy="name",
+    ).execute()
+    return results.get('files', [])
+
+
+def _create_drive_folder(folder_name, parent_id=None):
+    """Creates a new Google Drive folder and returns (id, name)."""
+    creds = _get_n8n_credentials()
+    if not creds:
+        raise Exception('No Google Drive credentials available')
+    from googleapiclient.discovery import build
+    service = build('drive', 'v3', credentials=creds)
+    metadata = {
+        'name': folder_name,
+        'mimeType': 'application/vnd.google-apps.folder',
+    }
+    if parent_id:
+        metadata['parents'] = [parent_id]
+    folder = service.files().create(body=metadata, fields='id,name').execute()
+    return folder['id'], folder['name']
+
+
+def _upload_file_to_drive_folder(folder_id, file_obj, filename, mime_type):
+    """Uploads a Django InMemoryUploadedFile to a Drive folder. Returns (file_id, file_name)."""
+    import tempfile as tmpmod
+    creds = _get_n8n_credentials()
+    if not creds:
+        raise Exception('No Google Drive credentials available')
+    from googleapiclient.discovery import build
+    from googleapiclient.http import MediaFileUpload
+    service = build('drive', 'v3', credentials=creds)
+
+    suffix = os.path.splitext(filename)[1] or '.jpg'
+    with tmpmod.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        for chunk in file_obj.chunks():
+            tmp.write(chunk)
+        tmp_path = tmp.name
 
     try:
-        from googleapiclient.discovery import build
-        service = build('drive', 'v3', credentials=creds)
-        metadata = service.files().get(fileId=file_id, fields="id,name,mimeType").execute()
-        mime_type = metadata.get('mimeType', 'image/jpeg')
-        content = service.files().get_media(fileId=file_id).execute()
-        base64_image = base64.b64encode(content).decode('utf-8')
-    except Exception as e:
-        return JsonResponse({'error': f'Failed to download file: {str(e)}'}, status=500)
+        file_metadata = {'name': filename, 'parents': [folder_id]}
+        media = MediaFileUpload(tmp_path, mimetype=mime_type or 'application/octet-stream', resumable=False)
+        uploaded = service.files().create(body=file_metadata, media_body=media, fields='id,name').execute()
+        return uploaded['id'], uploaded['name']
+    finally:
+        os.unlink(tmp_path)
 
-    openrouter_key = os.environ.get('OPENROUTER_API_KEY')
-    if not openrouter_key:
-        return JsonResponse({'error': 'OPENROUTER_API_KEY not configured'}, status=500)
 
-    ocr_prompt = """You are a BIR (Bureau of Internal Revenue) receipt OCR specialist for the Philippines. Extract all structured data from this receipt or invoice image.
+# ─────────────────────────────────────────────
+# SHARED OCR HELPER
+# ─────────────────────────────────────────────
+
+OCR_PROMPT = """You are a BIR (Bureau of Internal Revenue) receipt OCR specialist for the Philippines. Extract all structured data from this receipt or invoice image.
 
 Return ONLY a valid JSON object — no markdown, no explanation, no code fences. Use these exact field names:
 {
@@ -860,24 +889,43 @@ Rules:
 - For expense_category, infer from the business name and description
 - Return ONLY the JSON object, nothing else"""
 
-    try:
-        response = http_requests.post(
-            'https://openrouter.ai/api/v1/chat/completions',
-            headers={'Authorization': f'Bearer {openrouter_key}', 'Content-Type': 'application/json'},
-            json={
-                'model': 'openai/gpt-4o',
-                'max_tokens': 1024,
-                'messages': [{'role': 'user', 'content': [
-                    {'type': 'image_url', 'image_url': {'url': f'data:{mime_type};base64,{base64_image}', 'detail': 'high'}},
-                    {'type': 'text', 'text': ocr_prompt},
-                ]}]
-            },
-            timeout=60,
-        )
-        response.raise_for_status()
-        reply = response.json()['choices'][0]['message']['content']
-    except Exception as e:
-        return JsonResponse({'error': f'OpenRouter call failed: {str(e)}'}, status=500)
+
+def _run_ocr_and_save(file_id, file_name, folder_id, folder_name):
+    """
+    Downloads a Drive file, runs GPT-4o OCR via OpenRouter, saves Receipt.
+    Shared by both the n8n endpoint and the chat upload endpoint.
+    Returns the saved Receipt object.
+    """
+    creds = _get_n8n_credentials()
+    if not creds:
+        raise Exception('No stored Google credentials')
+
+    from googleapiclient.discovery import build
+    service = build('drive', 'v3', credentials=creds)
+    metadata = service.files().get(fileId=file_id, fields="id,name,mimeType").execute()
+    mime_type = metadata.get('mimeType', 'image/jpeg')
+    content = service.files().get_media(fileId=file_id).execute()
+    b64 = base64.b64encode(content).decode('utf-8')
+
+    openrouter_key = os.environ.get('OPENROUTER_API_KEY')
+    if not openrouter_key:
+        raise Exception('OPENROUTER_API_KEY not configured')
+
+    response = http_requests.post(
+        'https://openrouter.ai/api/v1/chat/completions',
+        headers={'Authorization': f'Bearer {openrouter_key}', 'Content-Type': 'application/json'},
+        json={
+            'model': 'openai/gpt-4o',
+            'max_tokens': 1024,
+            'messages': [{'role': 'user', 'content': [
+                {'type': 'image_url', 'image_url': {'url': f'data:{mime_type};base64,{b64}', 'detail': 'high'}},
+                {'type': 'text', 'text': OCR_PROMPT},
+            ]}]
+        },
+        timeout=60,
+    )
+    response.raise_for_status()
+    reply = response.json()['choices'][0]['message']['content']
 
     try:
         ocr_data = json.loads(reply.replace('```json', '').replace('```', '').strip())
@@ -895,7 +943,7 @@ Rules:
             except ValueError:
                 continue
 
-    Receipt.objects.update_or_create(
+    receipt, _ = Receipt.objects.update_or_create(
         drive_file_id=file_id,
         defaults={
             'drive_file_name':    file_name,
@@ -924,5 +972,609 @@ Rules:
             'total':              Decimal(str(ocr_data.get('total',            0) or 0)),
         }
     )
+    return receipt
+
+
+# ─────────────────────────────────────────────
+# OCR ENDPOINT (called by n8n Drive workflow)
+# ─────────────────────────────────────────────
+
+@csrf_exempt
+def process_ocr(request):
+    if not _is_n8n_request(request):
+        return JsonResponse({'error': 'Unauthorized'}, status=401)
+
+    try:
+        data = json.loads(request.body)
+    except Exception:
+        return JsonResponse({'error': 'Invalid JSON body'}, status=400)
+
+    file_id     = data.get('file_id')
+    folder_id   = data.get('folder_id', '')
+    folder_name = data.get('folder_name', '')
+    file_name   = data.get('file_name', '')
+
+    if not file_id:
+        return JsonResponse({'error': 'file_id is required'}, status=400)
+
+    try:
+        _run_ocr_and_save(file_id, file_name, folder_id, folder_name)
+    except Exception as e:
+        return JsonResponse({'error': str(e)}, status=500)
 
     return JsonResponse({'status': 'ok', 'file_id': file_id, 'file_name': file_name})
+
+
+# ─────────────────────────────────────────────
+# CHAT RECEIPT UPLOAD (user uploads via chat)
+# ─────────────────────────────────────────────
+
+def _list_all_drive_folders(creds):
+    """Return all non-trashed folders the user has access to."""
+    from googleapiclient.discovery import build
+    service = build('drive', 'v3', credentials=creds)
+    results = service.files().list(
+        q="mimeType='application/vnd.google-apps.folder' and trashed=false",
+        fields="files(id, name, parents)",
+        pageSize=500,
+        orderBy="name",
+    ).execute()
+    return results.get('files', [])
+
+
+def _find_folder_by_name(folders, name):
+    """Case-insensitive match: exact first, then partial."""
+    name_lower = name.strip().lower()
+    for f in folders:
+        if f['name'].lower() == name_lower:
+            return f
+    for f in folders:
+        if name_lower in f['name'].lower() or f['name'].lower() in name_lower:
+            return f
+    return None
+
+
+def _create_drive_folder(creds, name, parent_id=None):
+    """Create a new Google Drive folder, optionally inside a parent."""
+    from googleapiclient.discovery import build
+    service = build('drive', 'v3', credentials=creds)
+    metadata = {'name': name, 'mimeType': 'application/vnd.google-apps.folder'}
+    if parent_id:
+        metadata['parents'] = [parent_id]
+    return service.files().create(body=metadata, fields='id,name').execute()
+
+
+def _upload_file_to_folder(creds, folder_id, file_content, file_name, mime_type):
+    """Upload file bytes to a specific Drive folder."""
+    import tempfile
+    from googleapiclient.discovery import build
+    from googleapiclient.http import MediaFileUpload
+
+    service = build('drive', 'v3', credentials=creds)
+    suffix = os.path.splitext(file_name)[1] or '.jpg'
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(file_content)
+        tmp_path = tmp.name
+    try:
+        metadata = {'name': file_name, 'parents': [folder_id]}
+        media = MediaFileUpload(tmp_path, mimetype=mime_type, resumable=False)
+        return service.files().create(
+            body=metadata, media_body=media, fields='id,name,webViewLink'
+        ).execute()
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
+def _run_ocr_on_image(base64_image, mime_type, api_key):
+    """Run BIR receipt OCR via OpenRouter and return parsed dict."""
+    ocr_prompt = """You are a BIR receipt OCR specialist for the Philippines.
+Extract all structured data from this receipt image.
+Return ONLY a valid JSON object, no markdown, no explanation:
+{
+  "document_type": "official_receipt|invoice|sales_invoice|delivery_receipt|collection_receipt|acknowledgment_receipt|charge_invoice|cash_invoice|debit_memo|credit_memo|job_order|purchase_order|billing_statement|statement_of_account|unknown",
+  "vat_type": "vat|non_vat|zero_rated|vat_exempt|unknown",
+  "expense_category": "office_supplies|meals_entertainment|transportation|utilities|communication|professional_fees|rent|salaries|repairs_maintenance|taxes_licenses|insurance|advertising|miscellaneous|uncategorized",
+  "business_name": "",
+  "business_address": "",
+  "tin": "",
+  "receipt_number": "",
+  "bir_permit_number": "",
+  "expense_date": "YYYY-MM-DD or empty string",
+  "description": "",
+  "buyer_name": "",
+  "buyer_tin": "",
+  "subtotal": 0.00,
+  "vatable_sales": 0.00,
+  "vat_exempt_sales": 0.00,
+  "zero_rated_sales": 0.00,
+  "vat_amount": 0.00,
+  "total": 0.00
+}"""
+    response = http_requests.post(
+        'https://openrouter.ai/api/v1/chat/completions',
+        headers={'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'},
+        json={
+            'model': 'openai/gpt-4o',
+            'max_tokens': 1024,
+            'messages': [{'role': 'user', 'content': [
+                {'type': 'image_url', 'image_url': {'url': f'data:{mime_type};base64,{base64_image}', 'detail': 'high'}},
+                {'type': 'text', 'text': ocr_prompt},
+            ]}],
+        },
+        timeout=60,
+    )
+    response.raise_for_status()
+    raw = response.json()['choices'][0]['message']['content']
+    return json.loads(raw.replace('```json', '').replace('```', '').strip())
+
+
+@csrf_exempt
+@require_auth
+def upload_receipt_via_chat(request):
+    """
+    Called when the user uploads a receipt image in the chat panel.
+
+    Flow:
+    1. Read the uploaded image + user message
+    2. List all Drive folders
+    3. Ask GPT-4o to identify the target folder (or confirm creation)
+    4. Find or create the folder in Drive
+    5. Upload the image to Drive
+    6. Run OCR and save the Receipt record
+    7. Return a friendly AI reply summarising what happened
+    """
+    if request.method != 'POST':
+        return JsonResponse({'error': 'POST required'}, status=405)
+
+    uploaded_file = request.FILES.get('file')
+    user_message  = request.POST.get('message', '').strip() or 'Process this receipt.'
+    conversation_id = request.POST.get('conversation_id') or None
+
+    if not uploaded_file:
+        return JsonResponse({'error': 'No file provided'}, status=400)
+
+    # ── Drive credentials ──────────────────────────────────────────────────
+    from google_drive.utils import get_user_drive_credentials
+    creds = get_user_drive_credentials(request.user)
+    if not creds:
+        return JsonResponse({'error': 'Google Drive not connected. Please reconnect.'}, status=401)
+
+    api_key = os.environ.get('OPENROUTER_API_KEY', '')
+    if not api_key:
+        return JsonResponse({'error': 'OPENROUTER_API_KEY not configured'}, status=500)
+
+    # ── Get or create conversation ─────────────────────────────────────────
+    if conversation_id:
+        try:
+            conversation = Conversation.objects.get(id=conversation_id, user=request.user)
+        except Conversation.DoesNotExist:
+            conversation = Conversation.objects.create(
+                user=request.user, title=user_message[:60])
+    else:
+        conversation = Conversation.objects.create(
+            user=request.user, title=user_message[:60])
+
+    # Save user message (include filename for context)
+    user_chat_msg = ChatMessage.objects.create(
+        conversation=conversation,
+        role='user',
+        content=f'[Receipt upload: {uploaded_file.name}] {user_message}',
+    )
+
+    # ── Read file ──────────────────────────────────────────────────────────
+    file_content  = uploaded_file.read()
+    mime_type     = uploaded_file.content_type or 'image/jpeg'
+    file_name     = uploaded_file.name
+    base64_image  = base64.b64encode(file_content).decode('utf-8')
+
+    # ── List all Drive folders ─────────────────────────────────────────────
+    try:
+        all_folders = _list_all_drive_folders(creds)
+        folder_list_text = '\n'.join(
+            f"  - {f['name']} (id: {f['id']})" for f in all_folders[:100]
+        ) or '  (no folders found)'
+    except Exception as e:
+        print(f'Drive folder list error: {e}')
+        all_folders = []
+        folder_list_text = '(could not fetch folders)'
+
+    # ── Ask GPT-4o to parse folder intent ─────────────────────────────────
+    intent_prompt = f"""The user uploaded a receipt image and said: "{user_message}"
+
+Available Google Drive folders:
+{folder_list_text}
+
+Determine where this receipt should be uploaded.
+
+Return ONLY a JSON object:
+{{
+  "target_folder_name": "the folder name (from list or new name user wants)",
+  "folder_id": "matching id from the list above if found, else null",
+  "create_folder": true or false,
+  "parent_folder_id": "id of parent folder if creating inside one, else null",
+  "message": "one-line summary of what you will do"
+}}
+
+Rules:
+- Match folder names case-insensitively, partial match is fine
+- If the user says "create it" or the folder clearly doesn't exist, set create_folder=true
+- If the folder exists in the list, set folder_id and create_folder=false
+- Return ONLY the JSON, no markdown"""
+
+    try:
+        intent_resp = http_requests.post(
+            'https://openrouter.ai/api/v1/chat/completions',
+            headers={'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'},
+            json={
+                'model': 'openai/gpt-4o',
+                'max_tokens': 300,
+                'messages': [{'role': 'user', 'content': [
+                    {'type': 'image_url', 'image_url': {
+                        'url': f'data:{mime_type};base64,{base64_image}', 'detail': 'low'}},
+                    {'type': 'text', 'text': intent_prompt},
+                ]}],
+            },
+            timeout=30,
+        )
+        intent_resp.raise_for_status()
+        intent_raw = intent_resp.json()['choices'][0]['message']['content']
+        intent = json.loads(intent_raw.replace('```json', '').replace('```', '').strip())
+    except Exception as e:
+        print(f'Intent parse error: {e}')
+        reply = ("I had trouble identifying which folder to use. "
+                 "Please try again and mention the folder name clearly, e.g. "
+                 "\"This receipt is for the Admin Expense folder.\"")
+        agent_msg = ChatMessage.objects.create(
+            conversation=conversation, role='agent', content=reply)
+        conversation.save()
+        return JsonResponse({
+            'conversation_id': conversation.id,
+            'reply': reply,
+            'user_message_id': user_chat_msg.id,
+            'agent_message_id': agent_msg.id,
+        })
+
+    folder_id   = intent.get('folder_id')
+    folder_name = intent.get('target_folder_name', 'Uploads')
+    folder_created = False
+
+    # ── Find or create folder ──────────────────────────────────────────────
+    if not folder_id:
+        # One more attempt: fuzzy match locally
+        matched = _find_folder_by_name(all_folders, folder_name)
+        if matched:
+            folder_id   = matched['id']
+            folder_name = matched['name']
+        elif intent.get('create_folder'):
+            try:
+                parent_id  = intent.get('parent_folder_id')
+                new_folder = _create_drive_folder(creds, folder_name, parent_id)
+                folder_id  = new_folder['id']
+                folder_created = True
+            except Exception as e:
+                reply = f"I couldn't create the folder **{folder_name}**: {e}"
+                agent_msg = ChatMessage.objects.create(
+                    conversation=conversation, role='agent', content=reply)
+                conversation.save()
+                return JsonResponse({
+                    'conversation_id': conversation.id, 'reply': reply,
+                    'user_message_id': user_chat_msg.id, 'agent_message_id': agent_msg.id,
+                })
+        else:
+            # Folder not found and user didn't say to create — ask for clarification
+            available = ', '.join(f['name'] for f in all_folders[:10])
+            reply = (f"I couldn't find a folder named **{folder_name}**. "
+                     f"Would you like me to create it? Just say \"yes, create it\" "
+                     f"or choose from your existing folders:\n{available}")
+            agent_msg = ChatMessage.objects.create(
+                conversation=conversation, role='agent', content=reply)
+            conversation.save()
+            return JsonResponse({
+                'conversation_id': conversation.id, 'reply': reply,
+                'user_message_id': user_chat_msg.id, 'agent_message_id': agent_msg.id,
+            })
+
+    # ── Upload file to Drive ───────────────────────────────────────────────
+    try:
+        uploaded = _upload_file_to_folder(creds, folder_id, file_content, file_name, mime_type)
+        drive_file_id = uploaded['id']
+    except Exception as e:
+        reply = f"I found the folder **{folder_name}** but couldn't upload the file: {e}"
+        agent_msg = ChatMessage.objects.create(
+            conversation=conversation, role='agent', content=reply)
+        conversation.save()
+        return JsonResponse({
+            'conversation_id': conversation.id, 'reply': reply,
+            'user_message_id': user_chat_msg.id, 'agent_message_id': agent_msg.id,
+        })
+
+    # ── OCR ────────────────────────────────────────────────────────────────
+    try:
+        ocr_data = _run_ocr_on_image(base64_image, mime_type, api_key)
+    except Exception as e:
+        print(f'OCR error: {e}')
+        ocr_data = {
+            'document_type': 'unknown', 'vat_type': 'unknown',
+            'expense_category': 'uncategorized', 'total': 0,
+        }
+
+    # ── Parse expense date ─────────────────────────────────────────────────
+    expense_date = None
+    date_str = ocr_data.get('expense_date', '')
+    if date_str:
+        for fmt in ('%Y-%m-%d', '%m/%d/%Y', '%d/%m/%Y'):
+            try:
+                expense_date = datetime.strptime(date_str, fmt).date()
+                break
+            except ValueError:
+                continue
+
+    # ── Save Receipt record ────────────────────────────────────────────────
+    receipt, _ = Receipt.objects.update_or_create(
+        drive_file_id=drive_file_id,
+        defaults={
+            'user':              request.user,
+            'drive_file_name':   file_name,
+            'drive_folder_id':   folder_id,
+            'drive_folder_name': folder_name,
+            'status':            'processed',
+            'ocr_raw_text':      json.dumps(ocr_data),
+            'ocr_processed_at':  timezone.now(),
+            'document_type':     ocr_data.get('document_type',    'unknown'),
+            'vat_type':          ocr_data.get('vat_type',         'unknown'),
+            'expense_category':  ocr_data.get('expense_category', 'uncategorized'),
+            'business_name':     ocr_data.get('business_name',    ''),
+            'business_address':  ocr_data.get('business_address', ''),
+            'tin':               ocr_data.get('tin',              ''),
+            'receipt_number':    ocr_data.get('receipt_number',   ''),
+            'bir_permit_number': ocr_data.get('bir_permit_number',''),
+            'expense_date':      expense_date,
+            'description':       ocr_data.get('description',      ''),
+            'buyer_name':        ocr_data.get('buyer_name',       ''),
+            'buyer_tin':         ocr_data.get('buyer_tin',        ''),
+            'subtotal':          Decimal(str(ocr_data.get('subtotal',         0) or 0)),
+            'vatable_sales':     Decimal(str(ocr_data.get('vatable_sales',    0) or 0)),
+            'vat_exempt_sales':  Decimal(str(ocr_data.get('vat_exempt_sales', 0) or 0)),
+            'zero_rated_sales':  Decimal(str(ocr_data.get('zero_rated_sales', 0) or 0)),
+            'vat_amount':        Decimal(str(ocr_data.get('vat_amount',       0) or 0)),
+            'total':             Decimal(str(ocr_data.get('total',            0) or 0)),
+        }
+    )
+
+    # ── Build reply ────────────────────────────────────────────────────────
+    action    = f"created **{folder_name}** and uploaded" if folder_created else f"uploaded to **{folder_name}**"
+    business  = ocr_data.get('business_name') or 'Unknown'
+    total_amt = float(ocr_data.get('total', 0) or 0)
+    date_disp = ocr_data.get('expense_date') or 'Unknown date'
+    doc_type  = ocr_data.get('document_type', 'unknown').replace('_', ' ').title()
+    vat_type  = ocr_data.get('vat_type', 'unknown')
+
+    reply = (
+        f"Done! I've {action} your receipt.\n\n"
+        f"**Receipt Summary:**\n"
+        f"- Business: {business}\n"
+        f"- Amount: PHP {total_amt:,.2f}\n"
+        f"- Date: {date_disp}\n"
+        f"- Document type: {doc_type}\n"
+        f"- VAT type: {vat_type}"
+    )
+
+    # BIR compliance warnings
+    warnings = []
+    if not ocr_data.get('tin'):
+        warnings.append("TIN is missing")
+    if not ocr_data.get('receipt_number'):
+        warnings.append("Receipt number is missing")
+    if not ocr_data.get('bir_permit_number'):
+        warnings.append("BIR permit number is missing")
+    if warnings:
+        reply += "\n\n⚠️ **BIR Compliance:** " + ", ".join(warnings) + "."
+
+    agent_msg = ChatMessage.objects.create(
+        conversation=conversation,
+        role='agent',
+        content=reply,
+        metadata={'receipt_id': receipt.id, 'drive_file_id': drive_file_id, 'folder': folder_name},
+    )
+    conversation.save()
+
+    return JsonResponse({
+        'conversation_id': conversation.id,
+        'reply':           reply,
+        'user_message_id': user_chat_msg.id,
+        'agent_message_id': agent_msg.id,
+        'receipt_id':      receipt.id,
+    })
+
+
+# ─────────────────────────────────────────────
+# CHAT RECEIPT UPLOAD
+# ─────────────────────────────────────────────
+
+@csrf_exempt
+@require_auth
+def upload_receipt_via_chat(request):
+    """
+    Accepts a receipt image + a natural language message via multipart form.
+    - Parses which Drive folder the user wants using GPT
+    - Creates the folder if it doesn't exist and user requests it
+    - Uploads the file to Google Drive
+    - Runs OCR and saves the receipt to the DB
+    - Returns a conversational reply saved to chat history
+    """
+    if request.method != 'POST':
+        return JsonResponse({'error': 'POST required'}, status=405)
+
+    uploaded_file = request.FILES.get('file')
+    message = request.POST.get('message', '').strip()
+    conversation_id = request.POST.get('conversation_id') or None
+
+    if not uploaded_file:
+        return JsonResponse({'error': 'No file provided'}, status=400)
+
+    if not message:
+        message = 'Please upload this receipt'
+
+    # ── Get or create conversation ─────────────────────────────────────────
+    if conversation_id:
+        try:
+            conversation = Conversation.objects.get(id=conversation_id, user=request.user)
+        except Conversation.DoesNotExist:
+            return JsonResponse({'error': 'Conversation not found'}, status=404)
+    else:
+        conversation = Conversation.objects.create(
+            user=request.user,
+            title=f'Receipt upload: {uploaded_file.name[:50]}',
+        )
+
+    # Save user message (with filename noted)
+    ChatMessage.objects.create(
+        conversation=conversation,
+        role='user',
+        content=f'{message} [Attached: {uploaded_file.name}]',
+    )
+
+    # ── Get available Drive folders ────────────────────────────────────────
+    try:
+        drive_folders = _get_drive_folders()  # [{id, name, parents}]
+        folder_names = [f['name'] for f in drive_folders]
+        folder_map = {f['name'].lower(): f for f in drive_folders}
+    except Exception as e:
+        print(f'Drive folder fetch error: {e}')
+        drive_folders = []
+        folder_names = []
+        folder_map = {}
+
+    # ── Use AI to parse folder intent ─────────────────────────────────────
+    parse_prompt = f"""A user wants to upload a receipt to a specific Google Drive folder. Parse their message and determine the target folder.
+
+User message: "{message}"
+
+Available folders:
+{json.dumps(folder_names, indent=2)}
+
+Respond ONLY with a JSON object, no markdown, no explanation:
+{{
+  "target_folder_name": "the exact folder name from the list, or the new folder name the user wants to create",
+  "matched_existing": true or false,
+  "should_create": true or false,
+  "confidence": "high|medium|low"
+}}
+
+Rules:
+- Match case-insensitively and allow partial matches (e.g. "admin" matches "Admin Expense")
+- Set matched_existing to true only if the folder name is in the available list
+- Set should_create to true if the user says "create", "make", "there's no folder", "no folder yet", or similar
+- If no folder is mentioned and confidence would be low, still return your best guess with confidence "low"
+"""
+
+    try:
+        intent_reply, _ = _call_openrouter([{'role': 'user', 'content': parse_prompt}])
+        intent = json.loads(intent_reply.replace('```json', '').replace('```', '').strip())
+    except Exception as e:
+        print(f'Intent parse error: {e}')
+        intent = {'target_folder_name': None, 'matched_existing': False,
+                  'should_create': False, 'confidence': 'low'}
+
+    target_name = intent.get('target_folder_name', '')
+    matched = intent.get('matched_existing', False)
+    should_create = intent.get('should_create', False)
+    confidence = intent.get('confidence', 'low')
+
+    # ── Resolve folder ID ──────────────────────────────────────────────────
+    folder_id = None
+    resolved_folder_name = target_name
+    action_log = ''
+
+    if matched and target_name:
+        # Find by case-insensitive match
+        match = folder_map.get(target_name.lower())
+        if not match:
+            # Fuzzy fallback
+            for key, val in folder_map.items():
+                if target_name.lower() in key or key in target_name.lower():
+                    match = val
+                    break
+        if match:
+            folder_id = match['id']
+            resolved_folder_name = match['name']
+            action_log = f'uploaded to existing folder "{resolved_folder_name}"'
+
+    if not folder_id and (should_create or not matched) and target_name:
+        if should_create or confidence in ('high', 'medium'):
+            try:
+                folder_id, resolved_folder_name = _create_drive_folder(target_name)
+                action_log = f'created new folder "{resolved_folder_name}" and uploaded receipt there'
+            except Exception as e:
+                reply = f"I couldn't create the folder \"{target_name}\": {str(e)}"
+                ChatMessage.objects.create(conversation=conversation, role='agent', content=reply)
+                conversation.save()
+                return JsonResponse({'conversation_id': conversation.id, 'reply': reply, 'uploaded': False})
+
+    # ── No folder resolved — ask for clarification ─────────────────────────
+    if not folder_id:
+        folder_list_text = '\n'.join(f'  • {n}' for n in folder_names[:25]) or '  (no folders found)'
+        reply = (
+            f"I need to know which folder to put this receipt in.\n\n"
+            f"**Available folders:**\n{folder_list_text}\n\n"
+            f"You can say something like:\n"
+            f'  • *"This is for the Admin Expense folder"*\n'
+            f'  • *"Put it in Condo Dues"*\n'
+            f'  • *"Create a new folder called VIP Preparation and upload it there"*'
+        )
+        ChatMessage.objects.create(conversation=conversation, role='agent', content=reply)
+        conversation.save()
+        return JsonResponse({'conversation_id': conversation.id, 'reply': reply, 'uploaded': False})
+
+    # ── Upload to Drive ────────────────────────────────────────────────────
+    try:
+        file_id, file_name = _upload_file_to_drive_folder(
+            folder_id, uploaded_file, uploaded_file.name,
+            uploaded_file.content_type or 'image/jpeg',
+        )
+    except Exception as e:
+        reply = f"I found the folder \"{resolved_folder_name}\" but couldn't upload the file: {str(e)}"
+        ChatMessage.objects.create(conversation=conversation, role='agent', content=reply)
+        conversation.save()
+        return JsonResponse({'conversation_id': conversation.id, 'reply': reply, 'uploaded': False})
+
+    # ── Run OCR ────────────────────────────────────────────────────────────
+    ocr_note = ''
+    receipt_summary = ''
+    try:
+        receipt = _run_ocr_and_save(file_id, file_name, folder_id, resolved_folder_name)
+        total = f'PHP {receipt.total:,.2f}' if receipt.total else 'amount not detected'
+        merchant = receipt.business_name or 'merchant not detected'
+        date = receipt.expense_date or 'date not detected'
+        ocr_note = f'\n\n**OCR Result:**\n  • Merchant: {merchant}\n  • Amount: {total}\n  • Date: {date}'
+    except Exception as e:
+        print(f'OCR error for {file_id}: {e}')
+        ocr_note = '\n\n*OCR processing will be picked up by the background workflow shortly.*'
+
+    reply = (
+        f"Receipt uploaded successfully!\n\n"
+        f"**File:** {file_name}\n"
+        f"**Folder:** {resolved_folder_name}"
+        f"{ocr_note}"
+    )
+
+    ChatMessage.objects.create(
+        conversation=conversation,
+        role='agent',
+        content=reply,
+        metadata={
+            'uploaded_file_id': file_id,
+            'folder_id': folder_id,
+            'folder_name': resolved_folder_name,
+        },
+    )
+    conversation.save()
+
+    return JsonResponse({
+        'conversation_id': conversation.id,
+        'reply': reply,
+        'uploaded': True,
+        'file_id': file_id,
+        'folder_name': resolved_folder_name,
+    })
