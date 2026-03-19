@@ -10,10 +10,40 @@ async function apiFetch(path, options = {}) {
   return res.json();
 }
 
+// ── Date helpers ───────────────────────────────────────────────────────────
+function getDateRange(period = 'month') {
+  const today = new Date();
+  const pad = (n) => String(n).padStart(2, '0');
+  const fmt = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  const end = fmt(today);
+
+  let start;
+  if (period === 'year') {
+    start = `${today.getFullYear()}-01-01`;
+  } else if (period === 'quarter') {
+    const d = new Date(today);
+    d.setMonth(d.getMonth() - 3);
+    start = fmt(d);
+  } else {
+    // month (default)
+    start = `${today.getFullYear()}-${pad(today.getMonth() + 1)}-01`;
+  }
+
+  return { start, end };
+}
+
 // ── Analytics ──────────────────────────────────────────────────────────────
-export const fetchSummary    = ()       => apiFetch('/api/billing/analytics/summary/');
-export const fetchCategories = ()       => apiFetch('/api/billing/analytics/by-category/');
-export const fetchTrends     = ()       => apiFetch('/api/billing/analytics/trends/');
+export const fetchSummary = (period = 'month') => {
+  const { start, end } = getDateRange(period);
+  return apiFetch(`/api/billing/analytics/summary/?start=${start}&end=${end}`);
+};
+
+export const fetchCategories = (period = 'month') => {
+  const { start, end } = getDateRange(period);
+  return apiFetch(`/api/billing/analytics/by-category/?start=${start}&end=${end}`);
+};
+
+export const fetchTrends = () => apiFetch('/api/billing/analytics/trends/');
 
 // ── Receipts ───────────────────────────────────────────────────────────────
 export const fetchReceipts = (params = {}) => {

@@ -1,7 +1,6 @@
 'use client';
 
 import { useState, useEffect, useCallback, Fragment } from 'react';
-import { ArrowLeft } from 'lucide-react';
 import SpendSummaryCards from '../../components/analytics/SpendSummaryCards';
 import CategoryChart     from '../../components/analytics/CategoryChart';
 import TrendsChart       from '../../components/analytics/TrendsChart';
@@ -60,17 +59,19 @@ export default function DashboardClient() {
   const [receipts,   setReceipts]   = useState([]);
   const [loading,    setLoading]    = useState(true);
   const [error,      setError]      = useState(null);
+  // FIX: period is now used as a dependency for data loading
   const [period,     setPeriod]     = useState('month');
   const [convId,     setConvId]     = useState(null);
   const [lastRefresh, setLastRefresh] = useState(null);
 
-  const load = useCallback(async () => {
+  // FIX: load() now accepts the period and passes it to the API calls
+  const load = useCallback(async (activePeriod = 'month') => {
     setLoading(true);
     setError(null);
     try {
       const [s, c, t, r] = await Promise.all([
-        fetchSummary(),
-        fetchCategories(),
+        fetchSummary(activePeriod),
+        fetchCategories(activePeriod),
         fetchTrends(),
         fetchReceipts({ limit: 50 }),
       ]);
@@ -86,12 +87,20 @@ export default function DashboardClient() {
     }
   }, []);
 
-  useEffect(() => { load(); }, [load]);
+  // FIX: reload whenever period changes
+  useEffect(() => { load(period); }, [load, period]);
 
+  // Auto-refresh every 5 minutes, respecting current period
   useEffect(() => {
-    const id = setInterval(load, 5 * 60 * 1000);
+    const id = setInterval(() => load(period), 5 * 60 * 1000);
     return () => clearInterval(id);
-  }, [load]);
+  }, [load, period]);
+
+  // FIX: when period changes via radio buttons, also reload immediately
+  const handlePeriodChange = (newPeriod) => {
+    setPeriod(newPeriod);
+    // load() is called automatically via the useEffect above
+  };
 
   return (
     <>
@@ -110,7 +119,7 @@ export default function DashboardClient() {
                     id={`lw-period-${p.value}`}
                     name="lw-period"
                     checked={period === p.value}
-                    onChange={() => setPeriod(p.value)}
+                    onChange={() => handlePeriodChange(p.value)}
                   />
                   <label htmlFor={`lw-period-${p.value}`}>{p.label}</label>
                 </Fragment>
@@ -120,7 +129,7 @@ export default function DashboardClient() {
 
             <button
               className="lw-refresh"
-              onClick={load}
+              onClick={() => load(period)}
               disabled={loading}
               title={lastRefresh ? `Last refreshed: ${lastRefresh.toLocaleTimeString()}` : 'Refresh'}
               type="button"
@@ -198,7 +207,7 @@ export default function DashboardClient() {
             }}>
               <span>Could not load data: {error}</span>
               <button
-                onClick={load}
+                onClick={() => load(period)}
                 style={{
                   background: 'none',
                   border: 'none',
@@ -302,29 +311,10 @@ export default function DashboardClient() {
           transition: background-color 0.15s ease, transform 0.15s ease;
           box-shadow: 0 10px 18px rgba(19,48,32,0.16);
         }
-        .lw-refresh:hover {
-          background-color: var(--lw-green);
-        }
-        .lw-refresh:active {
-          transform: translateY(1px);
-        }
-        .lw-refresh svg {
-          display: inline;
-          width: 1rem;
-          height: 1rem;
-          color: var(--lw-white);
-        }
-        .lw-refresh:focus svg {
-          animation: spin_357 0.5s linear;
-        }
-        .lw-refresh:disabled {
-          opacity: 0.6;
-          cursor: not-allowed;
-        }
-        @keyframes spin_357 {
-          from { transform: rotate(0deg); }
-          to { transform: rotate(360deg); }
-        }
+        .lw-refresh:hover { background-color: var(--lw-green); }
+        .lw-refresh:active { transform: translateY(1px); }
+        .lw-refresh svg { display: inline; width: 1rem; height: 1rem; color: var(--lw-white); }
+        .lw-refresh:disabled { opacity: 0.6; cursor: not-allowed; }
         .lw-back {
           background: var(--lw-white);
           text-decoration: none;
@@ -343,46 +333,22 @@ export default function DashboardClient() {
           box-shadow: 0 6px 14px rgba(19, 48, 32, 0.12);
           transition: border-color 0.2s ease, box-shadow 0.2s ease;
         }
-        .lw-back:hover {
-          border-color: rgba(4, 98, 65, 0.25);
-          box-shadow: 0 10px 18px rgba(19, 48, 32, 0.16);
-        }
-        .lw-back-text {
-          position: relative;
-          z-index: 1;
-          transform: translateX(6px);
-          transition: color 0.2s ease, opacity 0.2s ease;
-        }
+        .lw-back:hover { border-color: rgba(4, 98, 65, 0.25); box-shadow: 0 10px 18px rgba(19, 48, 32, 0.16); }
+        .lw-back-text { position: relative; z-index: 1; transform: translateX(6px); transition: color 0.2s ease, opacity 0.2s ease; }
         .lw-back-icon {
-          position: absolute;
-          left: 6px;
-          top: 6px;
-          height: 34px;
-          width: 34px;
-          border-radius: 12px;
-          background: var(--lw-green);
-          display: inline-flex;
-          align-items: center;
-          justify-content: center;
-          z-index: 2;
-          transition: width 0.5s ease;
+          position: absolute; left: 6px; top: 6px; height: 34px; width: 34px;
+          border-radius: 12px; background: var(--lw-green);
+          display: inline-flex; align-items: center; justify-content: center;
+          z-index: 2; transition: width 0.5s ease;
         }
-        .lw-back:hover .lw-back-icon {
-          width: calc(100% - 12px);
-        }
-        .lw-back:hover .lw-back-text {
-          color: transparent;
-          opacity: 0;
-        }
+        .lw-back:hover .lw-back-icon { width: calc(100% - 12px); }
+        .lw-back:hover .lw-back-text { color: transparent; opacity: 0; }
 
         @media (max-width: 900px) {
           :root {
             --lw-navbar-padding: 12px 16px;
             --lw-navbar-height: 72px;
             --lw-content-padding: 20px 16px 96px;
-            --lw-center-pos: static;
-            --lw-center-left: auto;
-            --lw-center-transform: none;
             --lw-card-min: 280px;
             --lw-chat-width: 320px;
             --lw-chat-height: 520px;
@@ -391,27 +357,9 @@ export default function DashboardClient() {
             --lw-fab-right: 16px;
             --lw-fab-bottom: 16px;
           }
-          .lw-navbar {
-            flex-wrap: wrap;
-            gap: 10px;
-            align-items: flex-start;
-          }
-          .lw-navbar-left {
-            width: 100%;
-            justify-content: center;
-          }
-          .lw-navbar-center {
-            order: 3;
-            width: 100%;
-            text-align: center;
-            margin-top: 4px;
-          }
-          .lw-navbar-actions {
-            width: 100%;
-            justify-content: space-between;
-            flex-wrap: wrap;
-            gap: 10px;
-          }
+          .lw-navbar { flex-wrap: wrap; gap: 10px; align-items: flex-start; }
+          .lw-navbar-left { width: 100%; justify-content: center; }
+          .lw-navbar-actions { width: 100%; justify-content: space-between; flex-wrap: wrap; gap: 10px; }
         }
 
         .lw-period-group {
@@ -421,87 +369,36 @@ export default function DashboardClient() {
           position: relative;
           background: var(--bg);
           border-radius: 999px;
-          backdrop-filter: none;
-          box-shadow:
-            inset 0 1px 0 rgba(255, 255, 255, 0.8),
-            0 6px 16px rgba(19, 48, 32, 0.12);
+          box-shadow: inset 0 1px 0 rgba(255,255,255,0.8), 0 6px 16px rgba(19,48,32,0.12);
           overflow: hidden;
           width: fit-content;
         }
-        .lw-period-group input {
-          display: none;
-        }
+        .lw-period-group input { display: none; }
         .lw-period-group label {
-          flex: 1;
-          display: flex;
-          align-items: center;
-          justify-content: center;
-          min-width: 120px;
-          font-size: 12px;
-          padding: 0.55rem 1.1rem;
-          cursor: pointer;
-          font-weight: 700;
-          letter-spacing: 0.3px;
-          color: var(--text);
-          position: relative;
-          z-index: 2;
-          transition: color 0.3s ease-in-out;
-          font-family: "'Manrope', sans-serif";
-          white-space: nowrap;
+          flex: 1; display: flex; align-items: center; justify-content: center;
+          min-width: 120px; font-size: 12px; padding: 0.55rem 1.1rem;
+          cursor: pointer; font-weight: 700; letter-spacing: 0.3px;
+          color: var(--text); position: relative; z-index: 2;
+          transition: color 0.3s ease-in-out; white-space: nowrap;
         }
-        .lw-period-group label:hover {
-          color: #133020;
-        }
-        .lw-period-group input:checked + label {
-          color: #133020;
-        }
+        .lw-period-group label:hover { color: #133020; }
+        .lw-period-group input:checked + label { color: #133020; }
         .lw-period-glider {
-          position: absolute;
-          top: 0;
-          bottom: 0;
-          width: calc(100% / 3);
-          border-radius: 999px;
-          z-index: 1;
-          transition:
-            transform 0.5s cubic-bezier(0.37, 1.95, 0.66, 0.56),
-            background 0.4s ease-in-out,
-            box-shadow 0.4s ease-in-out;
+          position: absolute; top: 0; bottom: 0; width: calc(100% / 3);
+          border-radius: 999px; z-index: 1;
+          transition: transform 0.5s cubic-bezier(0.37, 1.95, 0.66, 0.56), background 0.4s ease-in-out, box-shadow 0.4s ease-in-out;
           background: linear-gradient(135deg, #ffd79a, #ffbf5c);
-          box-shadow:
-            0 6px 14px rgba(255, 179, 71, 0.3),
-            inset 0 1px 0 rgba(255, 255, 255, 0.6);
+          box-shadow: 0 6px 14px rgba(255,179,71,0.3), inset 0 1px 0 rgba(255,255,255,0.6);
         }
-
-        #lw-period-month:checked ~ .lw-period-glider {
-          transform: translateX(0%);
-          filter: brightness(0.96);
-        }
-
-        #lw-period-quarter:checked ~ .lw-period-glider {
-          transform: translateX(100%);
-          filter: brightness(0.96);
-        }
-
-        #lw-period-year:checked ~ .lw-period-glider {
-          transform: translateX(200%);
-          filter: brightness(0.96);
-        }
+        #lw-period-month:checked ~ .lw-period-glider { transform: translateX(0%); }
+        #lw-period-quarter:checked ~ .lw-period-glider { transform: translateX(100%); }
+        #lw-period-year:checked ~ .lw-period-glider { transform: translateX(200%); }
 
         @media (max-width: 600px) {
-          .lw-navbar-actions {
-            flex-direction: column;
-            align-items: stretch;
-          }
-          .lw-navbar-actions > div {
-            width: 100%;
-            justify-content: center;
-          }
           :root {
             --lw-card-min: 240px;
             --lw-chat-width: calc(100vw - 32px);
             --lw-chat-height: 70vh;
-            --lw-chat-right: 16px;
-            --lw-chat-bottom: 84px;
           }
         }
       `}</style>
