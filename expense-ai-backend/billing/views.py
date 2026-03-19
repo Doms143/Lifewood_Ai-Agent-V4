@@ -15,15 +15,12 @@ from django.utils import timezone
 
 from .models import Receipt, Conversation, ChatMessage
 
-N8N_WEBHOOK_URL = os.environ.get('N8N_WEBHOOK_URL', '')
-
 
 # ─────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────
 
 def require_auth(func):
-    """Returns 401 if user is not authenticated."""
     def wrapper(request, *args, **kwargs):
         if not request.user or not request.user.is_authenticated:
             return JsonResponse({'error': 'Not authenticated'}, status=401)
@@ -33,7 +30,6 @@ def require_auth(func):
 
 
 def _is_n8n_request(request):
-    """Check if request is authenticated via X-Agent-Secret header."""
     agent_secret = os.environ.get('N8N_AGENT_SECRET', '')
     request_secret = request.headers.get('X-Agent-Secret', '')
     return bool(agent_secret and request_secret == agent_secret)
@@ -49,40 +45,156 @@ def _get_n8n_credentials():
 
 
 def parse_date_range(request):
-    """
-    Parses ?start=YYYY-MM-DD&end=YYYY-MM-DD from query params.
-    Defaults to current month if not provided.
-    """
     today = timezone.now().date()
     start_str = request.GET.get('start')
     end_str = request.GET.get('end')
-
     try:
         start = datetime.strptime(start_str, '%Y-%m-%d').date() if start_str else today.replace(day=1)
         end = datetime.strptime(end_str, '%Y-%m-%d').date() if end_str else today
     except ValueError:
         start = today.replace(day=1)
         end = today
-
     return start, end
 
 
 def get_user_receipts(user):
-    """
-    Returns receipts belonging to this user OR receipts with no user assigned.
-    This handles the case where OCR processed files without a user_id.
-    """
+    """Returns receipts belonging to this user OR receipts with no user assigned."""
     return Receipt.objects.filter(Q(user=user) | Q(user__isnull=True))
 
 
 # ─────────────────────────────────────────────
-# CHAT ENDPOINTS
+# CHAT — INTERNAL AI (no n8n needed)
 # ─────────────────────────────────────────────
+
+def _build_analytics_context(user):
+    """Fetch this month's analytics directly from the DB for the AI system prompt."""
+    today = timezone.now().date()
+    start = today.replace(day=1)
+
+    base_qs = get_user_receipts(user).filter(
+        status='processed',
+        expense_date__range=[start, today],
+    )
+
+    prev_end = start - timedelta(days=1)
+    prev_start = prev_end.replace(day=1)
+    prev_total = get_user_receipts(user).filter(
+        status='processed',
+        expense_date__range=[prev_start, prev_end],
+    ).aggregate(t=Sum('total'))['t'] or Decimal('0')
+
+    summary = base_qs.aggregate(
+        total_spend=Sum('total'),
+        total_vat=Sum('vat_amount'),
+        transaction_count=Count('id'),
+        avg_transaction=Avg('total'),
+    )
+
+    categories = list(
+        base_qs.values('expense_category')
+        .annotate(total=Sum('total'), count=Count('id'))
+        .order_by('-total')[:6]
+    )
+
+    recent = list(
+        get_user_receipts(user).filter(status='processed')
+        .order_by('-expense_date')[:10]
+        .values('business_name', 'expense_category', 'document_type',
+                'total', 'vat_amount', 'expense_date', 'description',
+                'tin', 'receipt_number', 'vat_type', 'bir_permit_number')
+    )
+
+    total_spend = summary['total_spend'] or Decimal('0')
+    total_vat   = summary['total_vat']   or Decimal('0')
+    tx_count    = summary['transaction_count'] or 0
+    avg_tx      = summary['avg_transaction'] or Decimal('0')
+
+    change_pct = 0.0
+    if prev_total > 0:
+        change_pct = float((total_spend - prev_total) / prev_total * 100)
+
+    cat_lines = '\n'.join(
+        f"  - {c['expense_category']}: PHP {c['total']} ({c['count']} receipts)"
+        for c in categories
+    ) or '  (no category data)'
+
+    recent_lines = '\n'.join(
+        f"  - {r['expense_date'] or 'Unknown'} | {r['business_name'] or 'Unknown'} | "
+        f"PHP {r['total']} | {r['expense_category']} | VAT: {r['vat_type']} | "
+        f"TIN: {r['tin'] or 'missing'} | Receipt#: {r['receipt_number'] or 'missing'}"
+        for r in recent
+    ) or '  (no receipts yet)'
+
+    return f"""=== FINANCIAL SUMMARY (This Month: {start} to {today}) ===
+Total Spent      : PHP {total_spend}
+VAT Paid         : PHP {total_vat}
+Transactions     : {tx_count}
+Avg per Receipt  : PHP {avg_tx}
+vs Last Month    : {change_pct:+.1f}% (last month: PHP {prev_total})
+
+Top Expense Categories:
+{cat_lines}
+
+Recent Receipts (last 10):
+{recent_lines}"""
+
+
+def _build_memory_context(user, query, limit=6):
+    """Fetch relevant past messages for context."""
+    qs = (
+        ChatMessage.objects
+        .filter(conversation__user=user)
+        .select_related('conversation')
+        .order_by('-created_at')
+    )
+    if query:
+        qs = qs.filter(content__icontains=query)
+    messages = list(qs[:limit])
+    if not messages:
+        return ''
+    lines = '\n'.join(f"[{m.role}]: {m.content[:300]}" for m in messages)
+    return f"=== RELEVANT PAST CONVERSATIONS ===\n{lines}"
+
+
+def _call_openrouter(messages):
+    """Call OpenRouter (OpenAI-compatible) and return the reply text + usage."""
+    api_key = os.environ.get('OPENROUTER_API_KEY', '')
+    if not api_key:
+        raise ValueError('OPENROUTER_API_KEY is not set')
+
+    response = http_requests.post(
+        'https://openrouter.ai/api/v1/chat/completions',
+        headers={
+            'Authorization': f'Bearer {api_key}',
+            'Content-Type': 'application/json',
+            'HTTP-Referer': os.environ.get('FRONTEND_URL', 'https://lifewood.ai'),
+            'X-Title': 'Lifewood Expense AI',
+        },
+        json={
+            'model': 'openai/gpt-4o',
+            'max_tokens': 1500,
+            'messages': messages,
+        },
+        timeout=60,
+    )
+    response.raise_for_status()
+    data = response.json()
+    reply = data['choices'][0]['message']['content']
+    usage = data.get('usage', {})
+    return reply, usage
+
 
 @csrf_exempt
 @require_POST
 @require_auth
 def send_message(request):
+    """
+    Handles chat entirely within Django — no n8n dependency.
+    1. Loads conversation history
+    2. Fetches analytics + memory from DB
+    3. Calls OpenRouter/GPT-4o directly
+    4. Saves and returns the reply
+    """
     try:
         body = json.loads(request.body)
     except json.JSONDecodeError:
@@ -94,6 +206,7 @@ def send_message(request):
     if not user_message:
         return JsonResponse({'error': 'Message cannot be empty'}, status=400)
 
+    # ── Get or create conversation ─────────────────────────────────────────
     if conversation_id:
         try:
             conversation = Conversation.objects.get(id=conversation_id, user=request.user)
@@ -103,54 +216,89 @@ def send_message(request):
         title = user_message[:60] + ('...' if len(user_message) > 60 else '')
         conversation = Conversation.objects.create(user=request.user, title=title)
 
-    user_chat_message = ChatMessage.objects.create(
-        conversation=conversation, role='user', content=user_message,
+    # ── Save user message ──────────────────────────────────────────────────
+    user_chat_msg = ChatMessage.objects.create(
+        conversation=conversation,
+        role='user',
+        content=user_message,
     )
 
-    history = list(
+    # ── Build conversation history (last 10 turns) ─────────────────────────
+    history_qs = list(
         conversation.messages
-        .exclude(id=user_chat_message.id)
-        .values('role', 'content', 'created_at')
-        .order_by('created_at')
+        .exclude(id=user_chat_msg.id)
+        .order_by('-created_at')[:10]
     )
-    formatted_history = [
-        {'role': msg['role'], 'content': msg['content'], 'timestamp': msg['created_at'].isoformat()}
-        for msg in history
+    history_messages = [
+        {
+            'role': 'assistant' if m.role == 'agent' else 'user',
+            'content': m.content,
+        }
+        for m in reversed(history_qs)
     ]
 
-    agent_reply = ''
-    agent_metadata = {}
+    # ── Build system prompt with live data ────────────────────────────────
+    try:
+        analytics_context = _build_analytics_context(request.user)
+    except Exception as e:
+        print(f'Analytics context error: {e}')
+        analytics_context = '(analytics unavailable)'
 
-    if N8N_WEBHOOK_URL:
-        try:
-            n8n_payload = {
-                'message': user_message,
-                'conversation_id': conversation.id,
-                'user_id': request.user.id,
-                'user_email': request.user.email,
-                'history': formatted_history,
-            }
-            n8n_response = http_requests.post(N8N_WEBHOOK_URL, json=n8n_payload, timeout=100)
-            n8n_response.raise_for_status()
-            n8n_data = n8n_response.json()
-            agent_reply = n8n_data.get('reply', 'No response from agent.')
-            agent_metadata = n8n_data.get('metadata', {})
-        except Exception as e:
-            print(f'n8n webhook error: {e}')
-            agent_reply = 'I encountered an issue processing your request. Please try again in a moment.'
-    else:
-        agent_reply = 'AI agent is not configured yet. Please set the N8N_WEBHOOK_URL environment variable.'
+    try:
+        memory_context = _build_memory_context(request.user, user_message)
+    except Exception as e:
+        print(f'Memory context error: {e}')
+        memory_context = ''
 
-    agent_chat_message = ChatMessage.objects.create(
-        conversation=conversation, role='agent', content=agent_reply, metadata=agent_metadata,
+    system_prompt = f"""You are Lifewood's AI finance assistant. You help users understand their expense history, receipts, and BIR (Bureau of Internal Revenue) compliance in the Philippines.
+
+Guidelines:
+- Be concise, friendly, and professional
+- Always reference the actual data provided below when answering
+- Format all currency as PHP X,XXX.XX
+- If asked about something not in the data, say so honestly
+- You can only see this user's own expense data
+- When asked about BIR compliance, reference Philippine BIR rules (VAT registration, TIN requirements, official receipts, BIR permit numbers)
+- Flag any receipts missing TIN, receipt number, or BIR permit number as compliance risks
+
+{analytics_context}
+
+{memory_context}""".strip()
+
+    # ── Call OpenRouter ────────────────────────────────────────────────────
+    messages = [
+        {'role': 'system', 'content': system_prompt},
+        *history_messages,
+        {'role': 'user', 'content': user_message},
+    ]
+
+    try:
+        reply, usage = _call_openrouter(messages)
+        agent_metadata = {
+            'model': 'openai/gpt-4o',
+            'input_tokens': usage.get('prompt_tokens'),
+            'output_tokens': usage.get('completion_tokens'),
+            'total_tokens': usage.get('total_tokens'),
+        }
+    except Exception as e:
+        print(f'OpenRouter error: {e}')
+        reply = 'I encountered an issue reaching the AI. Please try again in a moment.'
+        agent_metadata = {}
+
+    # ── Save agent reply ───────────────────────────────────────────────────
+    agent_chat_msg = ChatMessage.objects.create(
+        conversation=conversation,
+        role='agent',
+        content=reply,
+        metadata=agent_metadata,
     )
     conversation.save()
 
     return JsonResponse({
         'conversation_id': conversation.id,
-        'user_message_id': user_chat_message.id,
-        'agent_message_id': agent_chat_message.id,
-        'reply': agent_reply,
+        'user_message_id': user_chat_msg.id,
+        'agent_message_id': agent_chat_msg.id,
+        'reply': reply,
         'metadata': agent_metadata,
     })
 
@@ -161,7 +309,6 @@ def get_conversation_history(request):
     conversation_id = request.GET.get('conversation_id')
     if not conversation_id:
         return JsonResponse({'error': 'conversation_id is required'}, status=400)
-
     try:
         conversation = Conversation.objects.get(id=conversation_id, user=request.user)
     except Conversation.DoesNotExist:
@@ -194,7 +341,7 @@ def list_conversations(request):
 
 
 # ─────────────────────────────────────────────
-# MEMORY ENDPOINT
+# MEMORY ENDPOINT (kept for n8n compatibility)
 # ─────────────────────────────────────────────
 
 @csrf_exempt
@@ -326,7 +473,6 @@ def list_receipts(request):
     if _is_n8n_request(request):
         receipts = Receipt.objects.all()
     elif request.user and request.user.is_authenticated:
-        # FIX: include receipts with no user (OCR-processed without user_id)
         receipts = get_user_receipts(request.user)
     else:
         return JsonResponse({'error': 'Not authenticated'}, status=401)
@@ -369,7 +515,6 @@ def list_receipts(request):
 @require_auth
 def get_receipt(request, receipt_id):
     try:
-        # FIX: also allow access to receipts with no user
         receipt = Receipt.objects.get(
             Q(id=receipt_id) & (Q(user=request.user) | Q(user__isnull=True))
         )
@@ -414,7 +559,6 @@ def get_receipt(request, receipt_id):
 def list_processed_file_ids(request):
     if not _is_n8n_request(request):
         return JsonResponse({'error': 'Unauthorized'}, status=401)
-
     file_ids = list(Receipt.objects.values_list('drive_file_id', flat=True))
     return JsonResponse({'processed_file_ids': file_ids, 'count': len(file_ids)})
 
@@ -429,28 +573,16 @@ def analytics_summary(request):
     start, end = parse_date_range(request)
     user = request.user
 
-    # FIX: include receipts with no user assigned
-    base_qs = get_user_receipts(user).filter(
-        status='processed',
-        expense_date__range=[start, end],
-    )
+    base_qs = get_user_receipts(user).filter(status='processed', expense_date__range=[start, end])
 
-    duration = (end - start).days
+    duration = max((end - start).days, 1)
     prev_end = start - timedelta(days=1)
-    prev_start = prev_end - timedelta(days=max(duration, 1))
-
-    prev_qs = get_user_receipts(user).filter(
-        status='processed',
-        expense_date__range=[prev_start, prev_end],
-    )
+    prev_start = prev_end - timedelta(days=duration)
+    prev_qs = get_user_receipts(user).filter(status='processed', expense_date__range=[prev_start, prev_end])
 
     current_total = base_qs.aggregate(total=Sum('total'))['total'] or Decimal('0')
     prev_total = prev_qs.aggregate(total=Sum('total'))['total'] or Decimal('0')
-
-    if prev_total > 0:
-        change_pct = float((current_total - prev_total) / prev_total * 100)
-    else:
-        change_pct = 0.0
+    change_pct = float((current_total - prev_total) / prev_total * 100) if prev_total > 0 else 0.0
 
     summary = base_qs.aggregate(
         total_spend=Sum('total'),
@@ -481,40 +613,28 @@ def analytics_summary(request):
 @require_auth
 def analytics_by_category(request):
     start, end = parse_date_range(request)
-
-    # FIX: include receipts with no user assigned
-    base_qs = get_user_receipts(request.user).filter(
-        status='processed',
-        expense_date__range=[start, end],
-    )
-
+    base_qs = get_user_receipts(request.user).filter(status='processed', expense_date__range=[start, end])
     grand_total = base_qs.aggregate(total=Sum('total'))['total'] or Decimal('1')
 
     categories = (
         base_qs
         .values('expense_category')
-        .annotate(
-            total_spend=Sum('total'),
-            transaction_count=Count('id'),
-            avg_spend=Avg('total'),
-        )
+        .annotate(total_spend=Sum('total'), transaction_count=Count('id'), avg_spend=Avg('total'))
         .order_by('-total_spend')
     )
 
-    result = []
-    for cat in categories:
-        pct = float(cat['total_spend'] / grand_total * 100) if grand_total else 0
-        result.append({
-            'category': cat['expense_category'],
-            'total_spend': str(cat['total_spend']),
-            'transaction_count': cat['transaction_count'],
-            'avg_spend': str(cat['avg_spend']),
-            'percentage': round(pct, 2),
-        })
-
     return JsonResponse({
         'period': {'start': start.isoformat(), 'end': end.isoformat()},
-        'by_category': result,
+        'by_category': [
+            {
+                'category': cat['expense_category'],
+                'total_spend': str(cat['total_spend']),
+                'transaction_count': cat['transaction_count'],
+                'avg_spend': str(cat['avg_spend']),
+                'percentage': round(float(cat['total_spend'] / grand_total * 100), 2),
+            }
+            for cat in categories
+        ],
     })
 
 
@@ -524,22 +644,16 @@ def analytics_trends(request):
     today = timezone.now().date()
     twelve_months_ago = today.replace(day=1) - timedelta(days=365)
 
-    # FIX: include receipts with no user assigned
     base_qs = get_user_receipts(request.user).filter(
-        status='processed',
-        expense_date__gte=twelve_months_ago,
+        status='processed', expense_date__gte=twelve_months_ago,
     )
 
     monthly = (
         base_qs
         .annotate(month=TruncMonth('expense_date'))
         .values('month')
-        .annotate(
-            total_spend=Sum('total'),
-            total_vat=Sum('vat_amount'),
-            transaction_count=Count('id'),
-            avg_spend=Avg('total'),
-        )
+        .annotate(total_spend=Sum('total'), total_vat=Sum('vat_amount'),
+                  transaction_count=Count('id'), avg_spend=Avg('total'))
         .order_by('month')
     )
 
@@ -577,7 +691,7 @@ def analytics_trends(request):
 
 
 # ─────────────────────────────────────────────
-# N8N PROXY ENDPOINT
+# N8N PROXY (kept for OCR workflow compatibility)
 # ─────────────────────────────────────────────
 
 @csrf_exempt
@@ -591,58 +705,36 @@ def n8n_analytics_proxy(request):
     except json.JSONDecodeError:
         body = {}
 
-    user_id = body.get('user_id')
     from django.contrib.auth import get_user_model
     User = get_user_model()
-    user = User.objects.filter(id=user_id).first()
-
+    user = User.objects.filter(id=body.get('user_id')).first()
     if not user:
         return JsonResponse({'error': 'User not found'}, status=404)
 
     today = timezone.now().date()
     start = today.replace(day=1)
-
-    # FIX: include receipts with no user assigned
-    base_qs = get_user_receipts(user).filter(
-        status='processed',
-        expense_date__range=[start, today],
-    )
-
     prev_end = start - timedelta(days=1)
     prev_start = prev_end.replace(day=1)
+
+    base_qs = get_user_receipts(user).filter(status='processed', expense_date__range=[start, today])
     prev_total = get_user_receipts(user).filter(
-        status='processed',
-        expense_date__range=[prev_start, prev_end],
+        status='processed', expense_date__range=[prev_start, prev_end],
     ).aggregate(total=Sum('total'))['total'] or Decimal('0')
 
     summary = base_qs.aggregate(
-        total_spend=Sum('total'),
-        total_vat=Sum('vat_amount'),
-        transaction_count=Count('id'),
-        avg_transaction=Avg('total'),
-    )
-
-    categories = list(
-        base_qs
-        .values('expense_category')
-        .annotate(total=Sum('total'), count=Count('id'))
-        .order_by('-total')
-    )
-
-    recent_receipts = list(
-        get_user_receipts(user).filter(status='processed')
-        .order_by('-expense_date')[:20]
-        .values(
-            'business_name', 'expense_category', 'document_type',
-            'total', 'vat_amount', 'expense_date', 'description',
-            'tin', 'receipt_number', 'vat_type', 'bir_permit_number',
-        )
+        total_spend=Sum('total'), total_vat=Sum('vat_amount'),
+        transaction_count=Count('id'), avg_transaction=Avg('total'),
     )
 
     current_total = summary['total_spend'] or Decimal('0')
-    change_pct = 0.0
-    if prev_total > 0:
-        change_pct = float((current_total - prev_total) / prev_total * 100)
+    change_pct = float((current_total - prev_total) / prev_total * 100) if prev_total > 0 else 0.0
+
+    categories = list(base_qs.values('expense_category').annotate(total=Sum('total'), count=Count('id')).order_by('-total'))
+    recent_receipts = list(
+        get_user_receipts(user).filter(status='processed').order_by('-expense_date')[:20]
+        .values('business_name', 'expense_category', 'document_type', 'total', 'vat_amount',
+                'expense_date', 'description', 'tin', 'receipt_number', 'vat_type', 'bir_permit_number')
+    )
 
     return JsonResponse({
         'summary': {
@@ -652,29 +744,19 @@ def n8n_analytics_proxy(request):
             'avg_transaction': str(summary['avg_transaction'] or 0),
             'period_start': start.isoformat(),
             'period_end': today.isoformat(),
-            'vs_prev_month': {
-                'previous_total': str(prev_total),
-                'change_pct': round(change_pct, 2),
-            },
+            'vs_prev_month': {'previous_total': str(prev_total), 'change_pct': round(change_pct, 2)},
         },
-        'by_category': [
-            {**c, 'total': str(c['total'])}
-            for c in categories
-        ],
+        'by_category': [{**c, 'total': str(c['total'])} for c in categories],
         'recent_receipts': [
-            {
-                **r,
-                'expense_date': r['expense_date'].isoformat() if r['expense_date'] else None,
-                'total': str(r['total']),
-                'vat_amount': str(r['vat_amount']),
-            }
+            {**r, 'expense_date': r['expense_date'].isoformat() if r['expense_date'] else None,
+             'total': str(r['total']), 'vat_amount': str(r['vat_amount'])}
             for r in recent_receipts
         ],
     })
 
 
 # ─────────────────────────────────────────────
-# OCR ENDPOINT
+# OCR ENDPOINT (called by n8n Drive workflow)
 # ─────────────────────────────────────────────
 
 @csrf_exempt
@@ -687,10 +769,10 @@ def process_ocr(request):
     except Exception:
         return JsonResponse({'error': 'Invalid JSON body'}, status=400)
 
-    file_id = data.get('file_id')
-    folder_id = data.get('folder_id', '')
+    file_id     = data.get('file_id')
+    folder_id   = data.get('folder_id', '')
     folder_name = data.get('folder_name', '')
-    file_name = data.get('file_name', '')
+    file_name   = data.get('file_name', '')
 
     if not file_id:
         return JsonResponse({'error': 'file_id is required'}, status=400)
@@ -752,15 +834,12 @@ Rules:
             json={
                 'model': 'openai/gpt-4o',
                 'max_tokens': 1024,
-                'messages': [{
-                    'role': 'user',
-                    'content': [
-                        {'type': 'image_url', 'image_url': {'url': f'data:{mime_type};base64,{base64_image}', 'detail': 'high'}},
-                        {'type': 'text', 'text': ocr_prompt}
-                    ]
-                }]
+                'messages': [{'role': 'user', 'content': [
+                    {'type': 'image_url', 'image_url': {'url': f'data:{mime_type};base64,{base64_image}', 'detail': 'high'}},
+                    {'type': 'text', 'text': ocr_prompt},
+                ]}]
             },
-            timeout=60
+            timeout=60,
         )
         response.raise_for_status()
         reply = response.json()['choices'][0]['message']['content']
@@ -768,10 +847,10 @@ Rules:
         return JsonResponse({'error': f'OpenRouter call failed: {str(e)}'}, status=500)
 
     try:
-        cleaned = reply.replace('```json', '').replace('```', '').strip()
-        ocr_data = json.loads(cleaned)
+        ocr_data = json.loads(reply.replace('```json', '').replace('```', '').strip())
     except Exception:
-        ocr_data = {'document_type': 'unknown', 'vat_type': 'unknown', 'expense_category': 'uncategorized', 'business_name': '', 'total': 0}
+        ocr_data = {'document_type': 'unknown', 'vat_type': 'unknown',
+                    'expense_category': 'uncategorized', 'business_name': '', 'total': 0}
 
     expense_date = None
     date_str = ocr_data.get('expense_date', '')
