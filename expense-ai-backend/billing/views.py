@@ -1,5 +1,6 @@
 import os
 import json
+import base64
 import requests as http_requests
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -37,6 +38,13 @@ def _is_n8n_request(request):
     request_secret = request.headers.get('X-Agent-Secret', '')
     return bool(agent_secret and request_secret == agent_secret)
 
+def _get_n8n_credentials():
+    from google_drive.models import GoogleDriveToken
+    from google_drive.utils import get_credentials_from_token
+    token = GoogleDriveToken.objects.first()
+    if not token:
+        return None
+    return get_credentials_from_token(token)
 
 def parse_date_range(request):
     """
@@ -870,7 +878,7 @@ Rules:
 - Return ONLY the JSON object, nothing else"""
 
     try:
-        response = requests.post(
+        response = http_requests.post(
             'https://openrouter.ai/api/v1/chat/completions',
             headers={
                 'Authorization': f'Bearer {openrouter_key}',
