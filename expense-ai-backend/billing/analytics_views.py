@@ -159,7 +159,7 @@ def risk_analytics(request):
     # ── Try budget overrun detection ──────────────────────────────────────
     budget_alerts = []
     try:
-        from .analytics_models import BudgetEntry
+        from .models import BudgetEntry
         month_str = str(start.month).zfill(2)
         budgets   = BudgetEntry.objects.filter(
             year=start.year, month=month_str
