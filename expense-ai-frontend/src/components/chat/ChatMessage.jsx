@@ -2,7 +2,7 @@
 
 import { formatPeso } from '../../lib/api';
 
-const BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'https://lifewoodai-agent-v4-production.up.railway.app';
+const BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'https://expense-ai-backend-eip2.onrender.com';
 
 function renderContent(text) {
   if (!text) return null;

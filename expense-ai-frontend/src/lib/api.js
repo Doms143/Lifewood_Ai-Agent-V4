@@ -1,4 +1,4 @@
-const BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'https://lifewoodai-agent-v4-production.up.railway.app';
+const BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'https://expense-ai-backend-eip2.onrender.com';
 
 async function apiFetch(path, options = {}) {
   const res = await fetch(`${BASE_URL}${path}`, {
