@@ -23,10 +23,11 @@ if settings.DEBUG:
     os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1'
 os.environ['OAUTHLIB_RELAX_TOKEN_SCOPE'] = '1'
 
-SCOPES = ['https://www.googleapis.com/auth/drive',
-            'openid',
-            'https://www.googleapis.com/auth/userinfo.email',
-            'https://www.googleapis.com/auth/userinfo.profile',
+SCOPES = [
+    'https://www.googleapis.com/auth/drive',
+    'openid',
+    'https://www.googleapis.com/auth/userinfo.email',
+    'https://www.googleapis.com/auth/userinfo.profile',
 ]
 
 FRONTEND_URL = os.environ.get('FRONTEND_URL', 'http://localhost:3000')
@@ -78,8 +79,10 @@ def google_drive_auth(request):
         access_type='offline',
         prompt='consent',
     )
-    # Store state only — no PKCE code_verifier
+    # Save state AND code_verifier (required by google-auth-oauthlib >= 1.0)
     request.session['google_oauth_state'] = state
+    if flow.code_verifier:
+        request.session['google_oauth_code_verifier'] = flow.code_verifier
     request.session.save()
     return redirect(authorization_url)
 
@@ -111,7 +114,10 @@ def _get_or_create_google_user(creds):
         or email.split('@')[0]
         or f'user-{uuid.uuid4().hex[:8]}'
     )
-    candidate = ''.join(ch if ch.isalnum() else '-' for ch in base_username.lower()).strip('-') or 'user'
+    candidate = (
+        ''.join(ch if ch.isalnum() else '-' for ch in base_username.lower())
+        .strip('-') or 'user'
+    )
     username = candidate
     suffix = 1
     while User.objects.filter(username=username).exists():
@@ -128,16 +134,22 @@ def _get_or_create_google_user(creds):
     )
     return user
 
+
 def oauth2callback(request):
     state = request.session.get('google_oauth_state') or request.GET.get('state')
+    # Restore code_verifier saved during google_drive_auth so PKCE validation passes
+    code_verifier = request.session.get('google_oauth_code_verifier')
 
     flow = Flow.from_client_secrets_file(
         _get_client_secrets_file(),
         scopes=SCOPES,
         redirect_uri=OAUTH_REDIRECT_URI,
         state=state,
-        # NO code_verifier here — this was causing "Malformed auth code"
     )
+
+    # Re-attach the code_verifier so google-auth-oauthlib can complete the exchange
+    if code_verifier:
+        flow.code_verifier = code_verifier
 
     try:
         auth_response = request.build_absolute_uri()
@@ -151,7 +163,11 @@ def oauth2callback(request):
     creds = flow.credentials
 
     try:
-        user = request.user if request.user.is_authenticated else _get_or_create_google_user(creds)
+        user = (
+            request.user
+            if request.user.is_authenticated
+            else _get_or_create_google_user(creds)
+        )
         auth_login(request, user)
     except Exception as e:
         print(f"User creation/login failed: {e}")
@@ -159,18 +175,18 @@ def oauth2callback(request):
 
     try:
         token_defaults = {
-            'access_token': creds.token,
-            'token_uri': creds.token_uri,
-            'client_id': creds.client_id,
+            'access_token':  creds.token,
+            'token_uri':     creds.token_uri,
+            'client_id':     creds.client_id,
             'client_secret': creds.client_secret,
-            'scopes': ','.join(creds.scopes),
+            'scopes':        ','.join(creds.scopes),
         }
         if creds.refresh_token:
             token_defaults['refresh_token'] = creds.refresh_token
 
         GoogleDriveToken.objects.update_or_create(
             user=user,
-            defaults=token_defaults
+            defaults=token_defaults,
         )
     except Exception as e:
         print(f"Token save failed: {e}")
@@ -178,12 +194,15 @@ def oauth2callback(request):
 
     return redirect(f'{FRONTEND_URL}/drive?status=success')
 
+
 def list_drive_files(request):
-    # Allow n8n background worker to use stored credentials
     if _is_n8n_request(request):
         creds = _get_n8n_credentials()
         if not creds:
-            return JsonResponse({'error': 'No stored Google credentials. A user must log in first.'}, status=401)
+            return JsonResponse(
+                {'error': 'No stored Google credentials. A user must log in first.'},
+                status=401,
+            )
     else:
         creds = get_user_drive_credentials(request.user)
         if not creds:
@@ -197,7 +216,7 @@ def list_drive_files(request):
                 q=f"'{folder_id}' in parents and trashed=false",
                 fields="files(id, name, mimeType, size, modifiedTime, webViewLink)",
                 pageSize=200,
-                orderBy="folder,name"
+                orderBy="folder,name",
             ).execute()
             items = results.get('files', [])
             for item in items:
@@ -209,7 +228,7 @@ def list_drive_files(request):
             q="mimeType='application/vnd.google-apps.folder' and name contains 'lifewood' and trashed=false",
             fields="files(id, name, mimeType, webViewLink)",
             pageSize=50,
-            orderBy="name"
+            orderBy="name",
         ).execute()
 
         lifewood_folders = folders_result.get('files', [])
@@ -227,7 +246,6 @@ def list_drive_files(request):
 
 
 def get_drive_file_content(request, file_id):
-    # Allow n8n background worker to use stored credentials
     if _is_n8n_request(request):
         creds = _get_n8n_credentials()
         if not creds:
@@ -280,7 +298,7 @@ def upload_drive_file(request, folder_id):
             temp_path = temp_file.name
 
         file_metadata = {
-            'name': uploaded_file.name,
+            'name':    uploaded_file.name,
             'parents': [folder_id],
         }
         media = MediaFileUpload(
