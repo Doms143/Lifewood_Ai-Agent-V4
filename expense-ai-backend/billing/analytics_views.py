@@ -245,7 +245,7 @@ def performance_analytics(request):
         qs.filter(expense_date__gte=twelve_weeks_ago)
         .annotate(week=TruncWeek('expense_date'))
         .values('week')
-        .annotate(count=Count('id'), total=Sum('total'))
+        .annotate(count=Count('id'), spend=Sum('total'))
         .order_by('week')
     )
 
@@ -313,7 +313,7 @@ def performance_analytics(request):
             'duration_days':       duration_days,
             'receipts_per_day':    receipts_per_day,
             'weekly_volume':       [
-                {'week': r['week'].strftime('%Y-%m-%d'), 'count': r['count'], 'total': str(r['total'])}
+                {'week': r['week'].strftime('%Y-%m-%d'), 'count': r['count'], 'total': str(r['spend'])}
                 for r in weekly
             ],
         },
@@ -359,13 +359,13 @@ def portfolio_analytics(request):
     folders = list(
         period_qs.values('drive_folder_name')
         .annotate(
-            total     =Sum('total'),
+            total_spend=Sum('total'),
             vat       =Sum('vat_amount'),
             count     =Count('id'),
             avg       =Avg('total'),
             vendors   =Count('business_name', distinct=True),
         )
-        .order_by('-total')
+        .order_by('-total_spend')
     )
 
     # Previous period for growth calculation
@@ -381,13 +381,13 @@ def portfolio_analytics(request):
     portfolio = []
     for f in folders:
         folder_name = f['drive_folder_name'] or 'Uncategorized'
-        pct         = round(float(f['total'] / grand_total * 100), 2)
+        pct = round(float(f['total_spend'] / grand_total * 100), 2)
         prev_total  = prev_folder_totals.get(f['drive_folder_name'], 0)
-        growth      = round((float(f['total']) - prev_total) / prev_total * 100, 2) if prev_total > 0 else None
-        vat_rate    = round(float(f['vat']) / float(f['total']) * 100, 2) if float(f['total']) > 0 else 0
+        growth      = round((float(f['total_spend']) - prev_total) / prev_total * 100, 2) if prev_total > 0 else None
+        vat_rate    = round(float(f['vat']) / float(f['total_spend']) * 100, 2) if float(f['total_spend']) > 0 else 0
         portfolio.append({
             'folder':          folder_name,
-            'total':           str(f['total']),
+            'total': str(f['total_spend']),
             'vat':             str(f['vat']),
             'count':           f['count'],
             'avg_transaction': str(round(_to_float(f['avg']), 2)),
@@ -713,7 +713,7 @@ def executive_summary(request):
     # This month
     curr = qs.filter(expense_date__range=[month_start, today])
     curr_agg = curr.aggregate(
-        total=Sum('total'), vat=Sum('vat_amount'),
+        total_spend=Sum('total'), vat=Sum('vat_amount'),
         count=Count('id'), avg=Avg('total')
     )
 
@@ -723,7 +723,7 @@ def executive_summary(request):
     prev_agg   = qs.filter(expense_date__range=[prev_start, prev_end]).aggregate(
         total=Sum('total'))
 
-    curr_total = _to_float(curr_agg['total'])
+    curr_total = _to_float(curr_agg['total_spend'])
     prev_total = _to_float(prev_agg['total'])
     mom_change = round((curr_total - prev_total) / prev_total * 100, 2) if prev_total > 0 else 0
 
