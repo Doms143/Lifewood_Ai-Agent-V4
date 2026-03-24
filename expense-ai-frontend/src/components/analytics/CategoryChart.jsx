@@ -97,7 +97,8 @@ export default function CategoryChart({ categories, loading }) {
     </div>
   );
 
-  const total = categories?.reduce((s, c) => s + parseFloat(c.total || 0), 0) || 0;
+  // FIX: use total_spend (the correct field from the API) consistently
+  const grandTotal = (categories || []).reduce((s, c) => s + parseFloat(c.total_spend || 0), 0);
 
   const data = (categories || [])
     .map((c, i) => ({
@@ -105,7 +106,9 @@ export default function CategoryChart({ categories, loading }) {
       value: parseFloat(c.total_spend || 0),
       count: c.transaction_count || 0,
       fill: BRAND_COLORS[i % BRAND_COLORS.length],
-      pct: total > 0 ? ((parseFloat(c.total) / total) * 100).toFixed(1) : '0.0',
+      pct: grandTotal > 0
+        ? ((parseFloat(c.total_spend || 0) / grandTotal) * 100).toFixed(1)
+        : '0.0',
     }))
     .sort((a, b) => b.value - a.value)
     .slice(0, 8);

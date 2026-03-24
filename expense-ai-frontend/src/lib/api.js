@@ -1,7 +1,26 @@
-const BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'https://lifewoodai-agent-v4-production.up.railway.app';
+const normalizeBaseUrl = (url = '') => url.trim().replace(/\/+$/, '');
+const isLocalHost = (hostname = '') => hostname === 'localhost' || hostname === '127.0.0.1';
+
+export const API_ENDPOINTS = {
+  local: process.env.NEXT_PUBLIC_LOCAL_API_URL || 'http://localhost:8000',
+  remote: process.env.NEXT_PUBLIC_REMOTE_API_URL || 'https://expense-ai-backend-eip2.onrender.com',
+};
+
+export function getApiBaseUrl() {
+  const explicit = normalizeBaseUrl(process.env.NEXT_PUBLIC_API_URL || '');
+  if (explicit) return explicit;
+
+  if (typeof window !== 'undefined') {
+    return normalizeBaseUrl(
+      isLocalHost(window.location.hostname) ? API_ENDPOINTS.local : API_ENDPOINTS.remote
+    );
+  }
+
+  return normalizeBaseUrl(process.env.NODE_ENV === 'development' ? API_ENDPOINTS.local : API_ENDPOINTS.remote);
+}
 
 async function apiFetch(path, options = {}) {
-  const res = await fetch(`${BASE_URL}${path}`, {
+  const res = await fetch(`${getApiBaseUrl()}${path}`, {
     credentials: 'include',
     headers: { 'Content-Type': 'application/json', ...options.headers },
     ...options,
@@ -10,10 +29,40 @@ async function apiFetch(path, options = {}) {
   return res.json();
 }
 
+// ── Date helpers ───────────────────────────────────────────────────────────
+function getDateRange(period = 'month') {
+  const today = new Date();
+  const pad = (n) => String(n).padStart(2, '0');
+  const fmt = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  const end = fmt(today);
+
+  let start;
+  if (period === 'year') {
+    start = `${today.getFullYear()}-01-01`;
+  } else if (period === 'quarter') {
+    const d = new Date(today);
+    d.setMonth(d.getMonth() - 3);
+    start = fmt(d);
+  } else {
+    // month (default)
+    start = `${today.getFullYear()}-${pad(today.getMonth() + 1)}-01`;
+  }
+
+  return { start, end };
+}
+
 // ── Analytics ──────────────────────────────────────────────────────────────
-export const fetchSummary    = ()       => apiFetch('/api/billing/analytics/summary/');
-export const fetchCategories = ()       => apiFetch('/api/billing/analytics/by-category/');
-export const fetchTrends     = ()       => apiFetch('/api/billing/analytics/trends/');
+export const fetchSummary = (period = 'month') => {
+  const { start, end } = getDateRange(period);
+  return apiFetch(`/api/billing/analytics/summary/?start=${start}&end=${end}`);
+};
+
+export const fetchCategories = (period = 'month') => {
+  const { start, end } = getDateRange(period);
+  return apiFetch(`/api/billing/analytics/by-category/?start=${start}&end=${end}`);
+};
+
+export const fetchTrends = () => apiFetch('/api/billing/analytics/trends/');
 
 // ── Receipts ───────────────────────────────────────────────────────────────
 export const fetchReceipts = (params = {}) => {
