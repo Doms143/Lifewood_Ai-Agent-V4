@@ -1,14 +1,13 @@
 'use client';
 
 import { useState, useEffect, useRef } from 'react';
-
 import { Bot } from 'lucide-react';
-import { sendMessage, fetchHistory } from '../../lib/api';
+import { fetchHistory } from '../../lib/api';
 import ChatMessage from './ChatMessage';
 import ChatInput   from './ChatInput';
 
-const LOGO_URL =
-  'https://framerusercontent.com/images/BZSiFYgRc4wDUAuEybhJbZsIBQY.png?width=1519&height=429';
+const BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'https://expense-ai-backend-eip2.onrender.com';
+const LOGO_URL  = 'https://framerusercontent.com/images/BZSiFYgRc4wDUAuEybhJbZsIBQY.png?width=1519&height=429';
 
 const fabStyle = (open) => ({
   position: 'fixed',
@@ -61,15 +60,14 @@ const headerStyle = {
   display: 'flex',
   alignItems: 'center',
   gap: '12px',
+  flexShrink: 0,
 };
 
 const msgBubble = (role) => ({
   maxWidth: '85%',
   padding: '10px 14px',
   borderRadius: role === 'user' ? '16px 16px 4px 16px' : '16px 16px 16px 4px',
-  background: role === 'user'
-    ? 'var(--lw-accent)'
-    : 'var(--lw-sea-salt)',
+  background: role === 'user' ? 'var(--lw-accent)' : 'var(--lw-sea-salt)',
   border: role === 'agent' ? '1px solid var(--lw-border)' : 'none',
   color: 'var(--lw-dark)',
   fontFamily: "'Manrope', sans-serif",
@@ -82,124 +80,296 @@ const msgBubble = (role) => ({
 
 const SUGGESTIONS = [
   'How much did I spend this month?',
-  'What are my top expense categories?',
+  'Show spending by folder',
+  'Export all receipts to Excel',
   'Are my receipts BIR compliant?',
-  'Explain VAT rules under EOPT Act',
 ];
+
+const BUBBLES = [
+  'How may I help you today?',
+  'Upload a receipt to scan it! 📎',
+  'Ask me how much you spend this month!',
+  'Export receipts to Excel 📊',
+  'Check if receipts are BIR compliant',
+  'Ask for spending by folder',
+  'Need help reviewing a receipt?',
+  'Want a quick expense summary?',
+  'Need VAT guidance?',
+];
+
+const FAB_SIZE     = 56;
+const GAP          = 12;
+const PANEL_OFFSET = 68;
 
 export default function ChatPanel({ conversationId, onConversationCreate }) {
   const [open,     setOpen]     = useState(false);
   const [messages, setMessages] = useState([]);
   const [loading,  setLoading]  = useState(false);
   const [convId,   setConvId]   = useState(conversationId || null);
-  const abortRef               = useRef(null);
-  const requestIdRef           = useRef(0);
-  const bottomRef              = useRef(null);
-  const [headPos, setHeadPos] = useState({ right: 12, bottom: 28 });
-  const [dragVisual, setDragVisual] = useState(null);
-  const dragState = useRef({ dragging: false, moved: false, startX: 0, startY: 0, startRight: 0, startBottom: 0 });
-  const panelRef = useRef(null);
-  const panelSize = useRef({ w: 380, h: 580 });
-  const [panelPos, setPanelPos] = useState(null);
-  const [snapping, setSnapping] = useState(false);
-  const [bubbleIndex, setBubbleIndex] = useState(0);
-  const [bubbleAnim, setBubbleAnim] = useState('bubble-in');
-  const [bubbleSide, setBubbleSide] = useState('right');
-  const bubbleRef = useRef(null);
-  const PANEL_OFFSET = 68;
-  const FAB_SIZE = 56;
-  const GAP = 12;
-  const BUBBLES = [
-    'How may I help you today?',
-    'Do you need anything?',
-    'Ask me how much you spend this month!',
-    'Want a quick expense summary?',
-    'Check if receipts are BIR compliant',
-    'Ask for top spending categories',
-    'Need help reviewing a receipt?',
-    'Ask for monthly trends',
-    'Need VAT guidance?',
-  ];
 
+  // ── Draggable FAB state ────────────────────────────────────────────────
+  const [headPos,     setHeadPos]     = useState({ right: 12, bottom: 28 });
+  const [dragVisual,  setDragVisual]  = useState(null);
+  const [panelPos,    setPanelPos]    = useState(null);
+  const [snapping,    setSnapping]    = useState(false);
+  const [bubbleIndex, setBubbleIndex] = useState(0);
+  const [bubbleAnim,  setBubbleAnim]  = useState('bubble-in');
+  const [bubbleSide,  setBubbleSide]  = useState('right');
+
+  const abortRef     = useRef(null);
+  const requestIdRef = useRef(0);
+  const bottomRef    = useRef(null);
+  const bubbleRef    = useRef(null);
+  const panelRef     = useRef(null);
+  const panelSize    = useRef({ w: 380, h: 580 });
+  const dragState    = useRef({
+    dragging: false, moved: false,
+    startX: 0, startY: 0, startRight: 0, startBottom: 0,
+  });
+
+  const currentRight  = dragVisual?.right  ?? headPos.right;
+  const currentBottom = dragVisual?.bottom ?? headPos.bottom;
+
+  // ── Load history when opened ───────────────────────────────────────────
   useEffect(() => {
     if (open && convId) {
-      fetchHistory(convId)
-        .then(data => setMessages(data.messages || []))
-        .catch(() => {});
+      fetchHistory(convId).then(d => setMessages(d.messages || [])).catch(() => {});
     }
   }, [open, convId]);
 
-  const currentRight = dragVisual?.right ?? headPos.right;
-  const currentBottom = dragVisual?.bottom ?? headPos.bottom;
+  // ── Scroll to bottom ───────────────────────────────────────────────────
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages, loading]);
 
+  // ── Rotate bubble text ─────────────────────────────────────────────────
   useEffect(() => {
     if (open) return;
     const id = window.setInterval(() => {
       setBubbleAnim('bubble-out');
       window.setTimeout(() => {
-        setBubbleIndex((prev) => (prev + 1) % BUBBLES.length);
+        setBubbleIndex(p => (p + 1) % BUBBLES.length);
         setBubbleAnim('bubble-in');
       }, 220);
     }, 6000);
     return () => window.clearInterval(id);
-  }, [open, BUBBLES.length]);
+  }, [open]);
 
+  // ── Bubble side based on FAB position ─────────────────────────────────
   useEffect(() => {
     if (open) return;
-    const vw = window.innerWidth;
+    const vw          = window.innerWidth;
     const bubbleWidth = bubbleRef.current?.offsetWidth || 220;
-    const bubbleGap = 72;
-    const fabLeft = vw - currentRight - FAB_SIZE;
-    const spaceRight = vw - (fabLeft + FAB_SIZE + bubbleGap);
-    const spaceLeft = fabLeft - bubbleGap;
-    if (spaceRight < bubbleWidth && spaceLeft >= bubbleWidth) {
-      setBubbleSide('left');
-    } else {
-      setBubbleSide('right');
-    }
+    const bubbleGap   = 72;
+    const fabLeft     = vw - currentRight - FAB_SIZE;
+    const spaceRight  = vw - (fabLeft + FAB_SIZE + bubbleGap);
+    setBubbleSide(spaceRight < bubbleWidth && fabLeft - bubbleGap >= bubbleWidth ? 'left' : 'right');
   }, [open, currentRight, bubbleIndex]);
 
+  // ── Restore FAB position from localStorage ─────────────────────────────
   useEffect(() => {
     try {
       const saved = window.localStorage.getItem('lwChatHeadPos');
       if (saved) {
         const parsed = JSON.parse(saved);
+        const vw       = window.innerWidth;
+        const maxRight = Math.max(12, vw - FAB_SIZE - 12);
         if (typeof parsed?.right === 'number' && typeof parsed?.bottom === 'number') {
-          const vw = window.innerWidth;
-          const maxRight = Math.max(12, vw - FAB_SIZE - 12);
-          const fabLeft = vw - parsed.right - FAB_SIZE;
+          const fabLeft   = vw - parsed.right - FAB_SIZE;
           const snapRight = fabLeft < vw / 2 ? maxRight : 12;
           setHeadPos({ right: snapRight, bottom: parsed.bottom });
         } else if ((parsed?.side === 'left' || parsed?.side === 'right') && typeof parsed?.bottom === 'number') {
-          const vw = window.innerWidth;
-          const maxRight = Math.max(12, vw - FAB_SIZE - 12);
           setHeadPos({ right: parsed.side === 'left' ? maxRight : 12, bottom: parsed.bottom });
         }
       }
     } catch {}
   }, []);
 
+  // ── Position panel relative to FAB ────────────────────────────────────
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages, loading]);
+    if (!open) return;
+    const id = requestAnimationFrame(() => {
+      updatePanelSize();
+      const vw        = window.innerWidth;
+      const fabLeft   = vw - currentRight - FAB_SIZE;
+      const openRight = fabLeft < vw / 2;
+      const targetLeft = openRight
+        ? fabLeft + FAB_SIZE + GAP
+        : fabLeft - panelSize.current.w - GAP;
+      setPanelPos(clampPanel({ left: targetLeft, bottom: currentBottom + PANEL_OFFSET }, panelSize.current));
+    });
+    return () => cancelAnimationFrame(id);
+  }, [open, currentRight, currentBottom]);
 
-  const handleSend = async (msg) => {
-    if (!msg || loading) return;
+  // ── Save FAB position ──────────────────────────────────────────────────
+  useEffect(() => {
+    if (!open) return;
+    try { window.localStorage.setItem('lwChatHeadPos', JSON.stringify(headPos)); } catch {}
+  }, [headPos, open]);
 
-    const userMsg = { role: 'user', content: msg, id: Date.now() };
-    setMessages(prev => [...prev, userMsg]);
+  // ── Reset on close ─────────────────────────────────────────────────────
+  useEffect(() => {
+    if (open) return;
+    setHeadPos({ right: 12, bottom: 28 });
+    setDragVisual(null);
+  }, [open]);
+
+  // ── Global drag listeners ──────────────────────────────────────────────
+  useEffect(() => {
+    const handleMove = (e) => {
+      if (!dragState.current.dragging) return;
+      const dx = e.clientX - dragState.current.startX;
+      const dy = e.clientY - dragState.current.startY;
+      if (Math.abs(dx) > 2 || Math.abs(dy) > 2) dragState.current.moved = true;
+      const next = clampPos(
+        { right: Math.max(12, dragState.current.startRight - dx), bottom: Math.max(12, dragState.current.startBottom - dy) },
+        { w: FAB_SIZE, h: FAB_SIZE },
+      );
+      setDragVisual(next);
+      if (open) {
+        const vw        = window.innerWidth;
+        const fabLeft   = vw - next.right - FAB_SIZE;
+        const openRight = fabLeft < vw / 2;
+        const targetLeft = openRight ? fabLeft + FAB_SIZE + GAP : fabLeft - panelSize.current.w - GAP;
+        setPanelPos(clampPanel({ left: targetLeft, bottom: next.bottom + PANEL_OFFSET }, panelSize.current));
+      }
+    };
+
+    const handleUp = () => {
+      dragState.current.dragging = false;
+      if (!dragVisual) return;
+      const vw        = window.innerWidth;
+      const maxRight  = Math.max(12, vw - FAB_SIZE - 12);
+      const fabLeft   = vw - dragVisual.right - FAB_SIZE;
+      const snapRight = fabLeft < vw / 2 ? maxRight : 12;
+      const snapped   = { right: snapRight, bottom: dragVisual.bottom };
+      setSnapping(true);
+      setHeadPos(snapped);
+      setDragVisual(null);
+      if (open) {
+        const targetLeft = snapRight === maxRight
+          ? (vw - snapRight - FAB_SIZE) + FAB_SIZE + GAP
+          : (vw - snapRight - FAB_SIZE) - panelSize.current.w - GAP;
+        setPanelPos(clampPanel({ left: targetLeft, bottom: snapped.bottom + PANEL_OFFSET }, panelSize.current));
+      }
+      window.setTimeout(() => setSnapping(false), 220);
+    };
+
+    window.addEventListener('mousemove', handleMove);
+    window.addEventListener('mouseup',   handleUp);
+    return () => {
+      window.removeEventListener('mousemove', handleMove);
+      window.removeEventListener('mouseup',   handleUp);
+    };
+  }, [dragVisual, open]);
+
+  // ── Window resize ──────────────────────────────────────────────────────
+  useEffect(() => {
+    const handleResize = () => {
+      updatePanelSize();
+      const base = { right: currentRight, bottom: currentBottom };
+      if (open) {
+        const vw        = window.innerWidth;
+        const fabLeft   = vw - base.right - FAB_SIZE;
+        const openRight = fabLeft < vw / 2;
+        const targetLeft = openRight ? fabLeft + FAB_SIZE + GAP : fabLeft - panelSize.current.w - GAP;
+        setPanelPos(clampPanel({ left: targetLeft, bottom: base.bottom + PANEL_OFFSET }, panelSize.current));
+      }
+      const clamped  = clampPos(base, { w: FAB_SIZE, h: FAB_SIZE });
+      const maxRight = Math.max(12, window.innerWidth - FAB_SIZE - 12);
+      setHeadPos({ right: clamped.right > 12 ? maxRight : 12, bottom: clamped.bottom });
+      setDragVisual(null);
+    };
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
+  }, [open, currentRight, currentBottom]);
+
+  // ── Helpers ───────────────────────────────────────────────────────────
+  const clampPos = (pos, size) => {
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    return {
+      right:  Math.min(Math.max(12, pos.right),  Math.max(12, vw - size.w - 12)),
+      bottom: Math.min(Math.max(12, pos.bottom), Math.max(12, vh - size.h - 12)),
+    };
+  };
+
+  const clampPanel = (pos, size) => {
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    return {
+      left:   Math.min(Math.max(12, pos.left),   Math.max(12, vw - size.w - 12)),
+      bottom: Math.min(Math.max(12, pos.bottom), Math.max(12, vh - size.h - 12)),
+    };
+  };
+
+  const updatePanelSize = () => {
+    if (!panelRef.current) return;
+    const rect = panelRef.current.getBoundingClientRect();
+    if (rect.width && rect.height) panelSize.current = { w: rect.width, h: rect.height };
+  };
+
+  const startDrag = (e) => {
+    dragState.current = {
+      dragging: true, moved: false,
+      startX: e.clientX, startY: e.clientY,
+      startRight: currentRight, startBottom: currentBottom,
+    };
+  };
+
+  // ── Send handler — plain messages AND file uploads ─────────────────────
+  const handleSend = async (msg, file = null) => {
+    if (!msg && !file) return;
+    if (loading) return;
+
+    const displayContent = file
+      ? `📎 ${file.name}${msg ? `\n${msg}` : ''}`
+      : msg;
+
+    setMessages(prev => [...prev, { role: 'user', content: displayContent, id: Date.now() }]);
     setLoading(true);
-    const requestId = ++requestIdRef.current;
+
+    const requestId  = ++requestIdRef.current;
     const controller = new AbortController();
     abortRef.current = controller;
 
     try {
-      const history = messages.slice(-10).map(m => ({ role: m.role, content: m.content }));
-      const data = await sendMessage(msg, convId, history, { signal: controller.signal });
+      let data;
 
-      if (controller.signal.aborted || requestIdRef.current !== requestId) {
-        return;
+      if (file) {
+        // ── Receipt image upload ─────────────────────────────────────────
+        const formData = new FormData();
+        formData.append('file', file);
+        formData.append('message', msg || 'Please process this receipt.');
+        if (convId) formData.append('conversation_id', String(convId));
+
+        const res = await fetch(`${BASE_URL}/api/billing/chat/upload-receipt/`, {
+          method: 'POST',
+          credentials: 'include',
+          body: formData,
+          signal: controller.signal,
+        });
+        if (!res.ok) {
+          const errData = await res.json().catch(() => ({}));
+          throw new Error(errData.error || `Upload failed: ${res.status}`);
+        }
+        data = await res.json();
+
+      } else {
+        // ── Normal text message ──────────────────────────────────────────
+        const history = messages.slice(-10).map(m => ({ role: m.role, content: m.content }));
+        const res = await fetch(`${BASE_URL}/api/billing/chat/message/`, {
+          method: 'POST',
+          credentials: 'include',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message: msg, conversation_id: convId, history }),
+          signal: controller.signal,
+        });
+        if (!res.ok) throw new Error(`Chat failed: ${res.status}`);
+        data = await res.json();
       }
+
+      if (controller.signal.aborted || requestIdRef.current !== requestId) return;
 
       if (data.conversation_id && !convId) {
         setConvId(data.conversation_id);
@@ -207,22 +377,20 @@ export default function ChatPanel({ conversationId, onConversationCreate }) {
       }
 
       setMessages(prev => [...prev, {
-        role: 'agent',
-        content: data.reply || data.message || 'No response',
-        id: Date.now() + 1,
+        role:     'agent',
+        content:  data.reply || data.message || 'No response',
+        id:       Date.now() + 1,
+        metadata: data.metadata || {},
       }]);
+
     } catch (err) {
       if (err?.name === 'AbortError') return;
-      setMessages(prev => [...prev, {
-        role: 'agent',
-        content: 'Could not reach the AI agent. Make sure n8n is running and the webhook URL is set.',
-        id: Date.now() + 1,
-        error: true,
-      }]);
+      const errMsg = file
+        ? `I had trouble processing your receipt: ${err.message}. Please check your Google Drive connection and try again.`
+        : 'Could not reach the AI agent. Please try again in a moment.';
+      setMessages(prev => [...prev, { role: 'agent', content: errMsg, id: Date.now() + 1, error: true }]);
     } finally {
-      if (requestIdRef.current === requestId) {
-        setLoading(false);
-      }
+      if (requestIdRef.current === requestId) setLoading(false);
     }
   };
 
@@ -234,196 +402,32 @@ export default function ChatPanel({ conversationId, onConversationCreate }) {
     setLoading(false);
   };
 
-  const clampPos = (pos, size) => {
-    const vw = window.innerWidth;
-    const vh = window.innerHeight;
-    const maxRight = Math.max(12, vw - size.w - 12);
-    const maxBottom = Math.max(12, vh - size.h - 12);
-    return {
-      right: Math.min(Math.max(12, pos.right), maxRight),
-      bottom: Math.min(Math.max(12, pos.bottom), maxBottom),
-    };
-  };
-
-  const clampPanel = (pos, size) => {
-    const vw = window.innerWidth;
-    const vh = window.innerHeight;
-    const maxLeft = Math.max(12, vw - size.w - 12);
-    const maxBottom = Math.max(12, vh - size.h - 12);
-    return {
-      left: Math.min(Math.max(12, pos.left), maxLeft),
-      bottom: Math.min(Math.max(12, pos.bottom), maxBottom),
-    };
-  };
-
-  const updatePanelSize = () => {
-    if (!panelRef.current) return;
-    const rect = panelRef.current.getBoundingClientRect();
-    if (rect.width && rect.height) {
-      panelSize.current = { w: rect.width, h: rect.height };
-    }
-  };
-
-  useEffect(() => {
-    if (!open) return;
-    const id = requestAnimationFrame(() => {
-      updatePanelSize();
-      const vw = window.innerWidth;
-      const fabLeft = vw - currentRight - FAB_SIZE;
-      const openRight = fabLeft < vw / 2;
-      const targetLeft = openRight
-        ? fabLeft + FAB_SIZE + GAP
-        : fabLeft - panelSize.current.w - GAP;
-      setPanelPos(
-        clampPanel(
-          { left: targetLeft, bottom: currentBottom + PANEL_OFFSET },
-          panelSize.current
-        )
-      );
-    });
-    return () => cancelAnimationFrame(id);
-  }, [open, currentRight, currentBottom]);
-
-  useEffect(() => {
-    if (!open) return;
-    try {
-      window.localStorage.setItem('lwChatHeadPos', JSON.stringify(headPos));
-    } catch {}
-  }, [headPos, open]);
-
-  useEffect(() => {
-    if (open) return;
-    setHeadPos({ right: 12, bottom: 28 });
-    setDragVisual(null);
-  }, [open]);
-
-  useEffect(() => {
-    const handleMove = (e) => {
-      if (!dragState.current.dragging) return;
-      const dx = e.clientX - dragState.current.startX;
-      const dy = e.clientY - dragState.current.startY;
-      if (Math.abs(dx) > 2 || Math.abs(dy) > 2) dragState.current.moved = true;
-      const nextRight = Math.max(12, dragState.current.startRight - dx);
-      const nextBottom = Math.max(12, dragState.current.startBottom - dy);
-      const clampedFab = clampPos({ right: nextRight, bottom: nextBottom }, { w: FAB_SIZE, h: FAB_SIZE });
-      setDragVisual(clampedFab);
-      if (open) {
-        const vw = window.innerWidth;
-        const fabLeft = vw - clampedFab.right - FAB_SIZE;
-        const openRight = fabLeft < vw / 2;
-        const targetLeft = openRight
-          ? fabLeft + FAB_SIZE + GAP
-          : fabLeft - panelSize.current.w - GAP;
-        setPanelPos(
-          clampPanel(
-            { left: targetLeft, bottom: clampedFab.bottom + PANEL_OFFSET },
-            panelSize.current
-          )
-        );
-      }
-    };
-
-  const handleUp = () => {
-    dragState.current.dragging = false;
-    if (!dragVisual) return;
-    const vw = window.innerWidth;
-    const maxRight = Math.max(12, vw - FAB_SIZE - 12);
-    const fabLeft = vw - dragVisual.right - FAB_SIZE;
-    const snapRight = fabLeft < vw / 2 ? maxRight : 12;
-    const snapped = { right: snapRight, bottom: dragVisual.bottom };
-    setSnapping(true);
-    setHeadPos(snapped);
-    setDragVisual(null);
-    if (open) {
-      const targetLeft = snapRight === maxRight
-        ? (vw - snapRight - FAB_SIZE) + FAB_SIZE + GAP
-        : (vw - snapRight - FAB_SIZE) - panelSize.current.w - GAP;
-      setPanelPos(
-        clampPanel(
-          { left: targetLeft, bottom: snapped.bottom + PANEL_OFFSET },
-          panelSize.current
-        )
-      );
-    }
-    window.setTimeout(() => setSnapping(false), 220);
-  };
-
-    window.addEventListener('mousemove', handleMove);
-    window.addEventListener('mouseup', handleUp);
-    return () => {
-      window.removeEventListener('mousemove', handleMove);
-      window.removeEventListener('mouseup', handleUp);
-    };
-  }, []);
-
-  useEffect(() => {
-    const handleResize = () => {
-      updatePanelSize();
-      const base = { right: currentRight, bottom: currentBottom };
-      if (open) {
-        const vw = window.innerWidth;
-        const fabLeft = vw - base.right - FAB_SIZE;
-        const openRight = fabLeft < vw / 2;
-        const targetLeft = openRight
-          ? fabLeft + FAB_SIZE + GAP
-          : fabLeft - panelSize.current.w - GAP;
-        setPanelPos(
-          clampPanel(
-            { left: targetLeft, bottom: base.bottom + PANEL_OFFSET },
-            panelSize.current
-          )
-        );
-      }
-      const clamped = clampPos(base, { w: FAB_SIZE, h: FAB_SIZE });
-      const maxRight = Math.max(12, window.innerWidth - FAB_SIZE - 12);
-      const snappedRight = clamped.right > 12 ? maxRight : 12;
-      setHeadPos({ right: snappedRight, bottom: clamped.bottom });
-      setDragVisual(null);
-    };
-    window.addEventListener('resize', handleResize);
-    return () => window.removeEventListener('resize', handleResize);
-  }, [open, currentRight, currentBottom]);
-
-  const startDrag = (e) => {
-    dragState.current.dragging = true;
-    dragState.current.moved = false;
-    dragState.current.startX = e.clientX;
-    dragState.current.startY = e.clientY;
-    dragState.current.startRight = currentRight;
-    dragState.current.startBottom = currentBottom;
-  };
-
   return (
     <>
+      {/* ── Chat panel ── */}
       <div
         ref={panelRef}
         style={{
           ...panelStyle(open, dragState.current.dragging),
-          left: panelPos ? `${panelPos.left}px` : 'auto',
-          right: panelPos ? 'auto' : 'var(--lw-chat-right)',
+          left:   panelPos ? `${panelPos.left}px`   : 'auto',
+          right:  panelPos ? 'auto'                 : 'var(--lw-chat-right)',
           bottom: panelPos ? `${panelPos.bottom}px` : 'var(--lw-chat-bottom)',
           transition: dragState.current.dragging
             ? 'none'
             : snapping
               ? 'all 0.22s cubic-bezier(0.2, 0.9, 0.2, 1)'
-              : panelStyle(open, dragState.current.dragging).transition,
+              : panelStyle(open, false).transition,
         }}
       >
+        {/* Header */}
         <div style={headerStyle}>
-          <div style={{
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            flexShrink: 0,
-          }}>
-            <img alt="Lifewood" src={LOGO_URL} style={{ height: '26px', width: 'auto' }} />
-          </div>
+          <img alt="Lifewood" src={LOGO_URL} style={{ height: '26px', width: 'auto', flexShrink: 0 }} />
           <div style={{ flex: 1 }}>
             <div style={{ fontFamily: "'Manrope', sans-serif", fontSize: '14px', fontWeight: 700, color: 'var(--lw-text)' }}>
               Expense AI
             </div>
             <div style={{ fontFamily: "'Manrope', sans-serif", fontSize: '11px', color: 'var(--lw-green)' }}>
-              Online - GPT-4o mini
+              Online · GPT-4o
             </div>
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
@@ -437,32 +441,21 @@ export default function ChatPanel({ conversationId, onConversationCreate }) {
             <button
               onClick={() => setOpen(false)}
               aria-label="Close chat"
-              style={{
-                width: '30px',
-                height: '30px',
-                borderRadius: '10px',
-                background: 'transparent',
-                border: 'none',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                color: 'var(--lw-dark)',
-                cursor: 'pointer',
-                boxShadow: 'none',
-              }}
+              style={{ width: '30px', height: '30px', borderRadius: '10px', background: 'transparent', border: 'none', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--lw-dark)', cursor: 'pointer' }}
             >
-              X
+              ✕
             </button>
           </div>
         </div>
 
+        {/* Messages */}
         <div style={{ flex: 1, overflowY: 'auto', padding: '16px', display: 'flex', flexDirection: 'column', gap: '10px' }}>
           {messages.length === 0 && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: '12px', paddingTop: '8px' }}>
               <div style={{ textAlign: 'center', padding: '14px 0' }}>
-                <div style={{ fontFamily: "'Manrope', sans-serif", fontSize: '13px', color: 'var(--lw-muted)', lineHeight: 1.5 }}>
-                  Ask me anything about your
-                  <br />expenses or BIR compliance
+                <div style={{ fontFamily: "'Manrope', sans-serif", fontSize: '13px', color: 'var(--lw-muted)', lineHeight: 1.6 }}>
+                  Ask about your expenses, export to Excel,<br />
+                  or <strong style={{ color: 'var(--lw-accent-deep)' }}>📎 attach a receipt</strong> to scan &amp; upload it
                 </div>
               </div>
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
@@ -474,7 +467,7 @@ export default function ChatPanel({ conversationId, onConversationCreate }) {
                       background: 'var(--lw-sea-salt)',
                       border: '1px solid var(--lw-border)',
                       borderRadius: '10px',
-                      padding: '10px 10px',
+                      padding: '10px',
                       color: 'var(--lw-text)',
                       fontFamily: "'Manrope', sans-serif",
                       fontSize: '11px',
@@ -501,6 +494,7 @@ export default function ChatPanel({ conversationId, onConversationCreate }) {
               timestamp={m.timestamp}
               error={m.error}
               receipts={m.receipts || []}
+              metadata={m.metadata || {}}
             />
           ))}
 
@@ -520,18 +514,14 @@ export default function ChatPanel({ conversationId, onConversationCreate }) {
           <div ref={bottomRef} />
         </div>
 
-        <ChatInput
-          onSend={handleSend}
-          onStop={handleStop}
-          isSending={loading}
-          disabled={loading}
-        />
+        <ChatInput onSend={handleSend} onStop={handleStop} isSending={loading} disabled={loading} />
       </div>
 
+      {/* ── Draggable FAB ── */}
       <button
         style={{
           ...fabStyle(open),
-          right: `${currentRight}px`,
+          right:  `${currentRight}px`,
           bottom: `${currentBottom}px`,
           cursor: dragState.current.dragging ? 'grabbing' : 'grab',
           transition: dragState.current.dragging
@@ -547,27 +537,24 @@ export default function ChatPanel({ conversationId, onConversationCreate }) {
         }}
         aria-label={open ? 'Close chat' : 'Open chat'}
       >
-        <span
-          aria-hidden="true"
-          style={{
-            position: 'absolute',
-            inset: '-18px',
-            borderRadius: '30px',
-            background: 'radial-gradient(circle at 50% 50%, rgba(255,179,71,0.75) 0%, rgba(255,179,71,0.3) 55%, rgba(255,179,71,0) 85%)',
-            filter: 'blur(9px)',
-            opacity: open ? 1 : 0.92,
-            animation: 'ai-aura 2.2s ease-in-out infinite, ai-glow 2.6s ease-in-out infinite',
-            zIndex: 0,
-            pointerEvents: 'none',
-          }}
-        />
+        {/* Aura glow */}
+        <span aria-hidden="true" style={{
+          position: 'absolute', inset: '-18px', borderRadius: '30px',
+          background: 'radial-gradient(circle at 50% 50%, rgba(255,179,71,0.75) 0%, rgba(255,179,71,0.3) 55%, rgba(255,179,71,0) 85%)',
+          filter: 'blur(9px)',
+          opacity: open ? 1 : 0.92,
+          animation: 'ai-aura 2.2s ease-in-out infinite, ai-glow 2.6s ease-in-out infinite',
+          zIndex: 0, pointerEvents: 'none',
+        }} />
+
+        {/* Bubble hint */}
         {!open && (
           <div
             ref={bubbleRef}
             style={{
               position: 'absolute',
-              right: bubbleSide === 'right' ? 'auto' : '72px',
-              left: bubbleSide === 'right' ? '72px' : 'auto',
+              right:  bubbleSide === 'right' ? 'auto' : '72px',
+              left:   bubbleSide === 'right' ? '72px'  : 'auto',
               bottom: '6px',
               background: 'rgba(255,255,255,0.65)',
               border: '2px solid rgba(19,48,32,0.25)',
@@ -587,79 +574,35 @@ export default function ChatPanel({ conversationId, onConversationCreate }) {
             {BUBBLES[bubbleIndex]}
           </div>
         )}
-        <span
-          className="lw-ai-icon"
-          style={{
-          width: '32px',
-          height: '32px',
-          borderRadius: '50%',
+
+        {/* Bot icon */}
+        <span className="lw-ai-icon" style={{
+          width: '32px', height: '32px', borderRadius: '50%',
           background: open ? 'var(--lw-sea-salt)' : '#ffd89b',
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'center',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
           color: 'var(--lw-dark)',
           animation: open
             ? 'ai-open 0.5s ease-out, ai-idle 2.8s ease-in-out infinite, ai-beat 1.8s ease-in-out infinite'
             : 'ai-idle 3.2s ease-in-out infinite, ai-beat 1.8s ease-in-out infinite',
           zIndex: 1,
-        }}
-        >
+        }}>
           <Bot size={16} strokeWidth={2.2} />
         </span>
       </button>
 
       <style>{`
-        @keyframes bounce {
-          0%, 80%, 100% { transform: translateY(0); opacity: 0.4; }
-          40% { transform: translateY(-6px); opacity: 1; }
-        }
-        @keyframes ai-open {
-          0% { transform: scale(0.7) rotate(-18deg); opacity: 0.6; }
-          60% { transform: scale(1.1) rotate(6deg); opacity: 1; }
-          100% { transform: scale(1) rotate(0deg); }
-        }
-        @keyframes ai-idle {
-          0%, 100% { transform: translateY(0); }
-          50% { transform: translateY(-2px); }
-        }
-        @keyframes ai-beat {
-          0%, 100% { transform: scale(1); }
-          45% { transform: scale(1.06); }
-          60% { transform: scale(0.98); }
-          75% { transform: scale(1.03); }
-        }
-        .lw-ai-icon {
-          transition: transform 0.2s ease, filter 0.2s ease;
-        }
-        button:hover .lw-ai-icon {
-          transform: scale(1.08) rotate(-6deg);
-          filter: drop-shadow(0 8px 12px rgba(255, 179, 71, 0.35));
-        }
-        @keyframes ai-aura {
-          0%, 100% { transform: scale(0.98); opacity: 0.6; }
-          50% { transform: scale(1.12); opacity: 1; }
-        }
-        @keyframes ai-glow {
-          0%, 100% { filter: blur(6px); }
-          50% { filter: blur(14px); }
-        }
-        @keyframes bubble-float {
-          0%, 100% { transform: translateY(0); opacity: 0.95; }
-          50% { transform: translateY(-4px); opacity: 1; }
-        }
-        @keyframes bubble-in {
-          0% { transform: translateY(6px) scale(0.98); opacity: 0; }
-          100% { transform: translateY(0) scale(1); opacity: 1; }
-        }
-        @keyframes bubble-out {
-          0% { transform: translateY(0) scale(1); opacity: 1; }
-          100% { transform: translateY(-6px) scale(0.98); opacity: 0; }
-        }
-        @keyframes pulse {
-          0%, 100% { opacity: 1; }
-          50% { opacity: 0.4; }
-        }
-
+        @keyframes bounce   { 0%,80%,100%{transform:translateY(0);opacity:.4}   40%{transform:translateY(-6px);opacity:1} }
+        @keyframes ai-open  { 0%{transform:scale(.7) rotate(-18deg);opacity:.6} 60%{transform:scale(1.1) rotate(6deg);opacity:1} 100%{transform:scale(1) rotate(0deg)} }
+        @keyframes ai-idle  { 0%,100%{transform:translateY(0)}  50%{transform:translateY(-2px)} }
+        @keyframes ai-beat  { 0%,100%{transform:scale(1)} 45%{transform:scale(1.06)} 60%{transform:scale(.98)} 75%{transform:scale(1.03)} }
+        @keyframes ai-aura  { 0%,100%{transform:scale(.98);opacity:.6} 50%{transform:scale(1.12);opacity:1} }
+        @keyframes ai-glow  { 0%,100%{filter:blur(6px)} 50%{filter:blur(14px)} }
+        @keyframes bubble-float { 0%,100%{transform:translateY(0);opacity:.95}  50%{transform:translateY(-4px);opacity:1} }
+        @keyframes bubble-in    { from{transform:translateY(6px) scale(.98);opacity:0} to{transform:translateY(0) scale(1);opacity:1} }
+        @keyframes bubble-out   { from{transform:translateY(0) scale(1);opacity:1}     to{transform:translateY(-6px) scale(.98);opacity:0} }
+        @keyframes pulse        { 0%,100%{opacity:1} 50%{opacity:.4} }
+        .lw-ai-icon { transition: transform .2s ease, filter .2s ease; }
+        button:hover .lw-ai-icon { transform: scale(1.08) rotate(-6deg); filter: drop-shadow(0 8px 12px rgba(255,179,71,.35)); }
       `}</style>
     </>
   );
